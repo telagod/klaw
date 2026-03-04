@@ -494,35 +494,16 @@ pub const MemoryRuntime = struct {
     /// Embeds the content and upserts into the vector store.
     /// Errors are caught and logged, never propagated.
     pub fn syncVectorAfterStore(self: *MemoryRuntime, allocator: std.mem.Allocator, key: []const u8, content: []const u8) void {
-        // Durable mode: enqueue and return (drain happens at turn boundaries / shutdown).
-        if (self._outbox) |ob| {
-            ob.enqueue(key, "upsert") catch |err| {
-                log.warn("outbox enqueue failed for key '{s}': {}", .{ key, err });
-            };
-            return;
-        }
-
-        const provider = self._embedding_provider orelse return;
-        const vs = self._vector_store orelse return;
-
-        // Check circuit breaker
-        if (self._circuit_breaker) |cb| {
-            if (!cb.allow()) return;
-        }
-
-        const emb = provider.embed(allocator, content) catch |err| {
-            log.warn("vector sync embed failed for key '{s}': {}", .{ key, err });
-            if (self._circuit_breaker) |cb| cb.recordFailure();
-            return;
-        };
-        defer allocator.free(emb);
-
-        if (self._circuit_breaker) |cb| cb.recordSuccess();
-        if (emb.len == 0) return;
-
-        vs.upsert(key, emb) catch |err| {
-            log.warn("vector sync upsert failed for key '{s}': {}", .{ key, err });
-        };
+        syncVectorUpsertWithComponents(
+            allocator,
+            key,
+            content,
+            self._outbox,
+            self._embedding_provider,
+            self._vector_store,
+            self._circuit_breaker,
+            "",
+        );
     }
 
     /// Drain the durable outbox (if configured).
@@ -657,6 +638,46 @@ const HygienePreserveSyncCtx = struct {
     circuit_breaker: ?*circuit_breaker.CircuitBreaker = null,
 };
 
+fn syncVectorUpsertWithComponents(
+    allocator: std.mem.Allocator,
+    key: []const u8,
+    content: []const u8,
+    outbox_inst: ?*outbox.VectorOutbox,
+    embed_provider: ?embeddings.EmbeddingProvider,
+    vector_store_inst: ?vector_store.VectorStore,
+    circuit_breaker_inst: ?*circuit_breaker.CircuitBreaker,
+    log_prefix: []const u8,
+) void {
+    // Durable mode: enqueue and return.
+    if (outbox_inst) |ob| {
+        ob.enqueue(key, "upsert") catch |err| {
+            log.warn("{s}outbox enqueue failed for key '{s}': {}", .{ log_prefix, key, err });
+        };
+        return;
+    }
+
+    const provider = embed_provider orelse return;
+    const vs = vector_store_inst orelse return;
+
+    if (circuit_breaker_inst) |cb| {
+        if (!cb.allow()) return;
+    }
+
+    const emb = provider.embed(allocator, content) catch |err| {
+        log.warn("{s}vector sync embed failed for key '{s}': {}", .{ log_prefix, key, err });
+        if (circuit_breaker_inst) |cb| cb.recordFailure();
+        return;
+    };
+    defer allocator.free(emb);
+
+    if (circuit_breaker_inst) |cb| cb.recordSuccess();
+    if (emb.len == 0) return;
+
+    vs.upsert(key, emb) catch |err| {
+        log.warn("{s}vector sync upsert failed for key '{s}': {}", .{ log_prefix, key, err });
+    };
+}
+
 fn syncPreservedChunkToVector(
     ctx_ptr: *anyopaque,
     allocator: std.mem.Allocator,
@@ -664,35 +685,16 @@ fn syncPreservedChunkToVector(
     content: []const u8,
 ) void {
     const ctx: *HygienePreserveSyncCtx = @ptrCast(@alignCast(ctx_ptr));
-
-    // Durable mode: enqueue and return.
-    if (ctx.outbox) |ob| {
-        ob.enqueue(key, "upsert") catch |err| {
-            log.warn("hygiene outbox enqueue failed for key '{s}': {}", .{ key, err });
-        };
-        return;
-    }
-
-    const provider = ctx.embed_provider orelse return;
-    const vs = ctx.vector_store orelse return;
-
-    if (ctx.circuit_breaker) |cb| {
-        if (!cb.allow()) return;
-    }
-
-    const emb = provider.embed(allocator, content) catch |err| {
-        log.warn("hygiene vector sync embed failed for key '{s}': {}", .{ key, err });
-        if (ctx.circuit_breaker) |cb| cb.recordFailure();
-        return;
-    };
-    defer allocator.free(emb);
-
-    if (ctx.circuit_breaker) |cb| cb.recordSuccess();
-    if (emb.len == 0) return;
-
-    vs.upsert(key, emb) catch |err| {
-        log.warn("hygiene vector sync upsert failed for key '{s}': {}", .{ key, err });
-    };
+    syncVectorUpsertWithComponents(
+        allocator,
+        key,
+        content,
+        ctx.outbox,
+        ctx.embed_provider,
+        ctx.vector_store,
+        ctx.circuit_breaker,
+        "hygiene ",
+    );
 }
 
 /// Create a MemoryRuntime from a MemoryConfig and workspace directory.

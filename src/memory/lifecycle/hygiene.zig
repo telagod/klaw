@@ -268,7 +268,7 @@ fn preserveConversationEntry(
 }
 
 /// Prune conversation rows older than retention_days via the Memory interface.
-/// Searches for conversation-tagged entries and deletes those whose timestamp is old.
+/// Lists conversation-tagged entries and deletes those whose timestamp is old.
 pub fn pruneConversationRows(allocator: std.mem.Allocator, mem: Memory, retention_days: u32) !u64 {
     return pruneConversationRowsWithPreserve(allocator, mem, retention_days, false, null);
 }
@@ -282,8 +282,9 @@ fn pruneConversationRowsWithPreserve(
 ) !u64 {
     const cutoff_secs = std.time.timestamp() - @as(i64, @intCast(retention_days)) * 24 * 60 * 60;
 
-    // Search for conversation-tagged entries
-    const results = mem.search(allocator, "conversation", 1000) catch return 0;
+    // List conversation-tagged entries directly so prune is independent of
+    // message text content.
+    const results = mem.list(allocator, .conversation, null) catch return 0;
     defer {
         for (results) |r| r.deinit(allocator);
         allocator.free(results);
@@ -313,10 +314,33 @@ fn pruneConversationRowsWithPreserve(
 
 /// Parse a unix timestamp from a conversation key like "conv_1234567890_abc".
 fn parseConversationTimestamp(key: []const u8) ?i64 {
-    if (!std.mem.startsWith(u8, key, "conv_")) return null;
-    const after_prefix = key[5..];
-    const underscore_pos = std.mem.indexOfScalar(u8, after_prefix, '_') orelse after_prefix.len;
-    return std.fmt.parseInt(i64, after_prefix[0..underscore_pos], 10) catch null;
+    if (std.mem.startsWith(u8, key, "conv_")) {
+        const after_prefix = key[5..];
+        const underscore_pos = std.mem.indexOfScalar(u8, after_prefix, '_') orelse after_prefix.len;
+        const raw = std.fmt.parseInt(u128, after_prefix[0..underscore_pos], 10) catch return null;
+        return normalizeTimestampToSeconds(raw);
+    }
+    if (std.mem.startsWith(u8, key, "autosave_user_")) {
+        const raw = std.fmt.parseInt(u128, key["autosave_user_".len..], 10) catch return null;
+        return normalizeTimestampToSeconds(raw);
+    }
+    if (std.mem.startsWith(u8, key, "autosave_assistant_")) {
+        const raw = std.fmt.parseInt(u128, key["autosave_assistant_".len..], 10) catch return null;
+        return normalizeTimestampToSeconds(raw);
+    }
+    return null;
+}
+
+fn normalizeTimestampToSeconds(raw: u128) ?i64 {
+    // Handle legacy second-based keys and newer high-precision autosave keys.
+    const ts_secs: u128 = if (raw >= 100_000_000_000_000)
+        raw / std.time.ns_per_s
+    else if (raw >= 100_000_000_000)
+        raw / std.time.ms_per_s
+    else
+        raw;
+    if (ts_secs > std.math.maxInt(i64)) return null;
+    return @intCast(ts_secs);
 }
 
 // ── Tests ─────────────────────────────────────────────────────────
@@ -407,6 +431,18 @@ test "parseConversationTimestamp invalid prefix" {
 
 test "parseConversationTimestamp no timestamp" {
     try std.testing.expect(parseConversationTimestamp("conv_notanumber_abc") == null);
+}
+
+test "parseConversationTimestamp autosave user key in nanoseconds" {
+    const key = "autosave_user_1700000000000000000";
+    const ts = parseConversationTimestamp(key) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(i64, 1700000000), ts);
+}
+
+test "parseConversationTimestamp autosave assistant key in nanoseconds" {
+    const key = "autosave_assistant_1700000000123000000";
+    const ts = parseConversationTimestamp(key) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(i64, 1700000000), ts);
 }
 
 // ── R3 Tests ──────────────────────────────────────────────────────
@@ -529,7 +565,7 @@ test "runIfDue preserves conversation rows before prune when enabled" {
     defer mem_impl.deinit();
     const mem = mem_impl.memory();
 
-    try mem.store("conv_1_old", "conversation message that should be archived", .conversation, null);
+    try mem.store("autosave_user_1700000000000000000", "conversation message that should be archived", .conversation, null);
 
     const report = runIfDue(std.testing.allocator, .{
         .hygiene_enabled = true,
@@ -541,7 +577,7 @@ test "runIfDue preserves conversation rows before prune when enabled" {
     }, mem, null);
 
     try std.testing.expectEqual(@as(u64, 1), report.pruned_conversation_rows);
-    const maybe_old = try mem.get(std.testing.allocator, "conv_1_old");
+    const maybe_old = try mem.get(std.testing.allocator, "autosave_user_1700000000000000000");
     if (maybe_old) |entry| {
         defer entry.deinit(std.testing.allocator);
     }
@@ -552,9 +588,9 @@ test "runIfDue preserves conversation rows before prune when enabled" {
 
     var found = false;
     for (preserved) |entry| {
-        if (std.mem.startsWith(u8, entry.key, "archive:conversation:conv_1_old:chunk:")) {
+        if (std.mem.startsWith(u8, entry.key, "archive:conversation:autosave_user_1700000000000000000:chunk:")) {
             found = true;
-            try std.testing.expect(std.mem.indexOf(u8, entry.content, "Archived conversation source: archive:conversation:conv_1_old") != null);
+            try std.testing.expect(std.mem.indexOf(u8, entry.content, "Archived conversation source: archive:conversation:autosave_user_1700000000000000000") != null);
         }
     }
     try std.testing.expect(found);
