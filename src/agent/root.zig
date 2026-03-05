@@ -1720,7 +1720,7 @@ pub const Agent = struct {
                     msg.content.len,
                     parts_count,
                     std.json.fmt(preview.slice, .{}),
-                    if (preview.truncated) " [truncated]" else "",
+                    if (preview.truncated) " [log preview truncated]" else "",
                 },
             );
         }
@@ -1743,7 +1743,7 @@ pub const Agent = struct {
                 response.tool_calls.len,
                 std.json.fmt(response.usage, .{}),
                 std.json.fmt(preview.slice, .{}),
-                if (preview.truncated) " [truncated]" else "",
+                if (preview.truncated) " [log preview truncated]" else "",
             },
         );
 
@@ -1757,7 +1757,7 @@ pub const Agent = struct {
                     attempt,
                     reasoning.len,
                     std.json.fmt(r_preview.slice, .{}),
-                    if (r_preview.truncated) " [truncated]" else "",
+                    if (r_preview.truncated) " [log preview truncated]" else "",
                 },
             );
         }
@@ -1774,7 +1774,7 @@ pub const Agent = struct {
                     if (tc.id.len > 0) tc.id else "-",
                     tc.name,
                     std.json.fmt(args_preview.slice, .{}),
-                    if (args_preview.truncated) " [truncated]" else "",
+                    if (args_preview.truncated) " [log preview truncated]" else "",
                 },
             );
         }
