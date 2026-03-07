@@ -12,7 +12,7 @@ const log = std.log.scoped(.telegram);
 const MEDIA_GROUP_FLUSH_SECS: u64 = 3;
 const TEMP_MEDIA_SWEEP_INTERVAL_POLLS: u32 = 20;
 const TEMP_MEDIA_TTL_SECS: i64 = 24 * 60 * 60;
-const DRAFT_FLUSH_MIN_DELTA_BYTES: usize = 64;
+const DRAFT_FLUSH_MIN_DELTA_BYTES: usize = 16;
 const DRAFT_FLUSH_MIN_INTERVAL_MS: i64 = 200;
 const TELEGRAM_BOT_COMMANDS_JSON =
     \\{"commands":[
