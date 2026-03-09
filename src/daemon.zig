@@ -1393,6 +1393,44 @@ test "resolveInboundRouteSessionKey routes slack channel messages by chat_id" {
     try std.testing.expectEqualStrings("agent:slack-channel-agent:slack:channel:C12345", routed.?);
 }
 
+test "resolveInboundRouteSessionKey routes threaded slack channel messages by base channel_id" {
+    const allocator = std.testing.allocator;
+    const bindings = [_]agent_routing.AgentBinding{
+        .{
+            .agent_id = "slack-channel-agent",
+            .match = .{
+                .channel = "slack",
+                .account_id = "sl-main",
+                .peer = .{ .kind = .channel, .id = "C12345" },
+            },
+        },
+    };
+    const config = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .agent_bindings = &bindings,
+        .channels = .{
+            .slack = &[_]@import("config_types.zig").SlackConfig{
+                .{ .account_id = "sl-main", .bot_token = "xoxb-token", .channel_id = "C12345" },
+            },
+        },
+    };
+    const msg = bus_mod.InboundMessage{
+        .channel = "slack",
+        .sender_id = "U777",
+        .chat_id = "C12345:1700.0",
+        .content = "threaded hello",
+        .session_key = "slack:sl-main:channel:C12345",
+        .metadata_json = "{\"account_id\":\"sl-main\",\"is_dm\":false,\"channel_id\":\"C12345\",\"message_id\":\"1700.1\",\"thread_id\":\"1700.0\"}",
+    };
+
+    const routed = resolveInboundRouteSessionKey(allocator, &config, &msg);
+    try std.testing.expect(routed != null);
+    defer allocator.free(routed.?);
+    try std.testing.expectEqualStrings("agent:slack-channel-agent:slack:channel:C12345:thread:1700.0", routed.?);
+}
+
 test "resolveInboundRouteSessionKey routes slack direct messages by sender" {
     const allocator = std.testing.allocator;
     const bindings = [_]agent_routing.AgentBinding{
