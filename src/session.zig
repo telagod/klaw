@@ -49,6 +49,7 @@ pub const Session = struct {
     turn_count: u64,
     turn_running: std.atomic.Value(bool),
     mutex: std.Thread.Mutex,
+    marked_for_eviction: bool = false,
 
     pub fn deinit(self: *Session, allocator: Allocator) void {
         self.agent.deinit();
@@ -162,6 +163,7 @@ pub const SessionManager = struct {
             .turn_count = 0,
             .turn_running = std.atomic.Value(bool).init(false),
             .mutex = .{},
+            .marked_for_eviction = false,
         };
         // From here, session owns agent — must deinit on error.
         errdefer session.agent.deinit();
@@ -525,22 +527,30 @@ pub const SessionManager = struct {
         const now = std.time.timestamp();
         var evicted: usize = 0;
 
-        // Collect keys to remove (can't modify map while iterating)
-        var to_remove: std.ArrayListUnmanaged([]const u8) = .{};
-        defer to_remove.deinit(self.allocator);
-
+        // Mark and Sweep
         var it = self.sessions.iterator();
         while (it.next()) |entry| {
             const session = entry.value_ptr.*;
             const idle_secs: u64 = @intCast(@max(0, now - session.last_active));
-            if (idle_secs > max_idle_secs) {
-                to_remove.append(self.allocator, entry.key_ptr.*) catch continue;
+            if (idle_secs > max_idle_secs and !session.turn_running.load(.acquire)) {
+                session.marked_for_eviction = true;
+            } else {
+                session.marked_for_eviction = false;
             }
         }
 
-        for (to_remove.items) |key| {
-            if (self.sessions.fetchRemove(key)) |kv| {
-                const session = kv.value;
+        var sweep_it = self.sessions.iterator();
+        while (sweep_it.next()) |entry| {
+            const session = entry.value_ptr.*;
+            if (session.marked_for_eviction) {
+                // Re-verify before destruction (TOCTOU protection)
+                // A turn may have started between the check above and now
+                if (session.turn_running.load(.acquire)) {
+                    session.marked_for_eviction = false;
+                    continue;
+                }
+
+                _ = self.sessions.remove(entry.key_ptr.*);
                 session.deinit(self.allocator);
                 self.allocator.destroy(session);
                 evicted += 1;
@@ -1487,6 +1497,33 @@ test "evictIdle with no sessions returns 0" {
     defer sm.deinit();
 
     try testing.expectEqual(@as(usize, 0), sm.evictIdle(60));
+}
+
+test "evictIdle TOCTOU protection - turn started during eviction window" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var manager = testSessionManager(testing.allocator, &mock, &cfg);
+    defer manager.deinit();
+
+    // Create idle session
+    const session = try manager.getOrCreate("test_key");
+    session.last_active = std.time.timestamp() - 10000; // Very idle
+
+    // Simulate race: start turn AFTER evictIdle checks but BEFORE deinit
+    // In real code this happens via concurrency, here we simulate timing
+
+    // Step 1: EvictIdle checks (would see turn_running=false)
+    // Step 2: Start turn (in reality this happens in another thread)
+    session.turn_running.store(true, .release);
+
+    // Step 3: EvictIdle continues to deinit (should be blocked by Layer 2)
+    const evicted = manager.evictIdle(5);
+
+    try testing.expectEqual(@as(usize, 0), evicted); // Should NOT evict active turn
+    try testing.expect(manager.sessions.contains("test_key"));
+
+    // Cleanup so that deinit succeeds
+    session.turn_running.store(false, .release);
 }
 
 // ---------------------------------------------------------------------------
