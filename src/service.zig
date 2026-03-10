@@ -285,7 +285,8 @@ fn preferredHomebrewShimPath(allocator: std.mem.Allocator, exe_path: []const u8)
         return null;
     }
 
-    const candidate = try std.fs.path.join(allocator, &.{ exe_path[0..cellar_index], "bin", "nullclaw" });
+    // selfExePath uses POSIX separators for Homebrew installs even when tests run on Windows.
+    const candidate = try std.fmt.allocPrint(allocator, "{s}/bin/nullclaw", .{exe_path[0..cellar_index]});
     return candidate;
 }
 
