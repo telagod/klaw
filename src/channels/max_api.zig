@@ -19,7 +19,7 @@ pub const BASE_URL = "https://platform-api.max.ru";
 pub const MAX_MESSAGE_LEN: usize = 4000;
 
 // Update types requested via long-polling.
-const UPDATE_TYPES = "message_created,message_callback,message_edited,message_removed,bot_added,bot_removed,bot_started";
+const UPDATE_TYPES = "message_created,message_callback,message_edited,message_removed,bot_added,bot_removed,bot_started,bot_stopped";
 
 // ════════════════════════════════════════════════════════════════════════════
 // Types
@@ -274,7 +274,7 @@ pub const Client = struct {
         try body.appendSlice(allocator, "{\"url\":");
         try root.json_util.appendJsonString(&body, allocator, webhook_url);
         if (secret) |s| {
-            try body.appendSlice(allocator, ",\"secret_key\":");
+            try body.appendSlice(allocator, ",\"secret\":");
             try root.json_util.appendJsonString(&body, allocator, s);
         }
         try body.appendSlice(allocator, ",\"update_types\":[");

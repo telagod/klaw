@@ -186,7 +186,6 @@ else
             pub fn setBus(_: *@This(), _: anytype) void {}
         };
     };
-pub const max_api = @import("max_api.zig");
 pub const max = if (@import("build_options").enable_channel_max)
     @import("max.zig")
 else

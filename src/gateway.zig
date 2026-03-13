@@ -2665,6 +2665,8 @@ fn handleMaxWebhookRoute(ctx: *WebhookHandlerContext) void {
     // Verify webhook secret if configured
     var max_bot_token: []const u8 = "";
     var max_allow_from: []const []const u8 = &.{};
+    var max_group_allow_from: []const []const u8 = &.{};
+    var max_group_policy: []const u8 = "allowlist";
     var max_account_id: []const u8 = "default";
     var max_webhook_secret: ?[]const u8 = null;
 
@@ -2672,6 +2674,8 @@ fn handleMaxWebhookRoute(ctx: *WebhookHandlerContext) void {
         if (cfg.channels.maxPrimary()) |max_cfg| {
             max_bot_token = max_cfg.bot_token;
             max_allow_from = max_cfg.allow_from;
+            max_group_allow_from = max_cfg.group_allow_from;
+            max_group_policy = max_cfg.group_policy;
             max_account_id = max_cfg.account_id;
             max_webhook_secret = max_cfg.webhook_secret;
         }
@@ -2708,8 +2712,8 @@ fn handleMaxWebhookRoute(ctx: *WebhookHandlerContext) void {
         .allocator = ctx.req_allocator,
         .bot_token = max_bot_token,
         .allow_from = max_allow_from,
-        .group_allow_from = &.{},
-        .group_policy = "allowlist",
+        .group_allow_from = max_group_allow_from,
+        .group_policy = max_group_policy,
     };
 
     if (max_ch.processUpdate(ctx.req_allocator, parsed.value)) |inbound| {
@@ -2738,8 +2742,8 @@ fn handleMaxWebhookRoute(ctx: *WebhookHandlerContext) void {
                     .allocator = ctx.req_allocator,
                     .bot_token = max_bot_token,
                     .allow_from = max_allow_from,
-                    .group_allow_from = &.{},
-                    .group_policy = "allowlist",
+                    .group_allow_from = max_group_allow_from,
+                    .group_policy = max_group_policy,
                 };
                 send_ch.sendMessage(reply_target, userFacingAgentError(err)) catch {};
                 break :blk null;
@@ -2750,8 +2754,8 @@ fn handleMaxWebhookRoute(ctx: *WebhookHandlerContext) void {
                     .allocator = ctx.req_allocator,
                     .bot_token = max_bot_token,
                     .allow_from = max_allow_from,
-                    .group_allow_from = &.{},
-                    .group_policy = "allowlist",
+                    .group_allow_from = max_group_allow_from,
+                    .group_policy = max_group_policy,
                 };
                 send_ch.sendMessage(reply_target, r) catch {};
             }
