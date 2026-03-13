@@ -147,13 +147,14 @@ zig build -Doptimize=ReleaseSmall
 - Termux 原生构建使用当前环境的 native target，通常不需要手动传 `-Dtarget`
 - 在 Android / Termux 上，建议先跑前台命令（如 `agent`、`gateway`），确认没问题后再考虑后台托管
 - 官方 release 提供 `aarch64`、`armv7`、`x86_64` 的 Android / Termux 预构建二进制
+- 更完整的说明和排错见 [Termux 指南](./termux.md)。
 
 ### 为 Android 交叉编译
 
-如果你是在另一台机器上给 Android / Termux 设备构建，需要显式传入 Zig target：
+如果你是在另一台机器上给 Android / Termux 设备构建，需要显式传入 Zig target，并提供 Android 的 libc/sysroot 文件；只传 `-Dtarget` 还不够：
 
 ```bash
-zig build -Dtarget=aarch64-linux-android.24 -Doptimize=ReleaseSmall
+zig build -Dtarget=aarch64-linux-android.24 -Doptimize=ReleaseSmall --libc /path/to/android-libc-aarch64.txt
 ```
 
 常见 Android targets：
@@ -162,7 +163,7 @@ zig build -Dtarget=aarch64-linux-android.24 -Doptimize=ReleaseSmall
 - `arm-linux-androideabi.24`，配合 `-Dcpu=baseline+v7a`
 - `x86_64-linux-android.24`
 
-选择与目标手机或模拟器架构匹配的 target。官方 release 也附带基于 Android API 24 构建的对应二进制。
+选择与目标手机或模拟器架构匹配的 target。完整的 `--libc` 文件生成示例可参考 [`.github/workflows/release.yml`](../../.github/workflows/release.yml)。官方 release 也附带基于 Android API 24 构建的对应二进制。
 
 ## 将二进制加入 PATH
 
@@ -229,6 +230,7 @@ brew uninstall nullclaw
 ## 相关页面
 
 - [中文文档入口](./README.md)
+- [Termux 指南](./termux.md)
 - [配置指南](./configuration.md)
 - [使用与运维](./usage.md)
 - [命令参考](./commands.md)

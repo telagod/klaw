@@ -161,13 +161,14 @@ Notes:
 - This uses the native target of the current Termux environment, so you usually do **not** need `-Dtarget`.
 - On Android / Termux, prefer foreground use first (`agent`, `gateway`) before trying to manage it as a background service.
 - Official releases publish pre-built Android / Termux binaries for `aarch64`, `armv7`, and `x86_64`.
+- For the fuller Android / Termux path, including troubleshooting, see [Termux Guide](./termux.md).
 
 ### Cross-compiling for Android
 
-If you are building on another machine for a Termux / Android device, pass an explicit Zig target:
+If you are building on another machine for a Termux / Android device, pass an explicit Zig target and an Android libc/sysroot file. `-Dtarget` alone is not enough:
 
 ```bash
-zig build -Dtarget=aarch64-linux-android.24 -Doptimize=ReleaseSmall
+zig build -Dtarget=aarch64-linux-android.24 -Doptimize=ReleaseSmall --libc /path/to/android-libc-aarch64.txt
 ```
 
 Common Android targets:
@@ -177,6 +178,7 @@ Common Android targets:
 - `x86_64-linux-android.24`
 
 Use the target that matches the phone or emulator architecture.
+See [`.github/workflows/release.yml`](../../.github/workflows/release.yml) for a complete example of generating the `--libc` file from the Android NDK.
 Official releases also attach matching Android / Termux binaries built for Android API 24.
 
 ## Add Binary to PATH
@@ -237,6 +239,7 @@ brew uninstall nullclaw
 ## Related Pages
 
 - [README](./README.md)
+- [Termux Guide](./termux.md)
 - [Configuration](./configuration.md)
 - [Usage and Operations](./usage.md)
 - [Commands](./commands.md)
