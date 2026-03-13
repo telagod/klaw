@@ -19,6 +19,7 @@ const agent_routing = @import("agent_routing.zig");
 const channel_catalog = @import("channel_catalog.zig");
 const channel_adapters = @import("channel_adapters.zig");
 const heartbeat_mod = @import("heartbeat.zig");
+const interaction_choices = @import("interactions/choices.zig");
 const memory_mod = @import("memory/root.zig");
 const bootstrap_mod = @import("bootstrap/root.zig");
 const onboard = @import("onboard.zig");
@@ -539,6 +540,26 @@ fn resolveInboundRouteSessionKeyWithMetadata(
         }, meta) orelse return null
     else
         return null;
+
+    if (std.mem.eql(u8, msg.channel, "telegram") and
+        peer.kind == .group and
+        meta.thread_id != null)
+    {
+        const topic_peer_id = std.fmt.allocPrint(allocator, "{s}:thread:{s}", .{ peer.id, meta.thread_id.? }) catch return null;
+        defer allocator.free(topic_peer_id);
+
+        const route = agent_routing.resolveRouteWithSession(allocator, .{
+            .channel = msg.channel,
+            .account_id = account_id,
+            .peer = .{ .kind = peer.kind, .id = topic_peer_id },
+            .parent_peer = peer,
+            .guild_id = meta.guild_id,
+            .team_id = meta.team_id,
+        }, config.agent_bindings, config.agents, config.session) catch return null;
+        allocator.free(route.main_session_key);
+        return route.session_key;
+    }
+
     const route = agent_routing.resolveRouteWithSession(allocator, .{
         .channel = msg.channel,
         .account_id = account_id,
@@ -674,7 +695,39 @@ fn publishStreamingChunk(ctx_ptr: *anyopaque, event: streaming.Event) void {
 }
 
 fn supportsStreamingOutbound(channel: []const u8) bool {
-    return std.mem.eql(u8, channel, "web") or std.mem.eql(u8, channel, "telegram");
+    return std.mem.eql(u8, channel, "web") or
+        std.mem.eql(u8, channel, "telegram") or
+        std.mem.eql(u8, channel, "dingtalk");
+}
+
+fn makeAssistantReplyOutbound(
+    allocator: std.mem.Allocator,
+    channel: []const u8,
+    account_id: ?[]const u8,
+    chat_id: []const u8,
+    reply: []const u8,
+) !bus_mod.OutboundMessage {
+    if (std.mem.indexOf(u8, reply, interaction_choices.START_TAG) == null) {
+        return if (account_id) |aid|
+            bus_mod.makeOutboundWithAccount(allocator, channel, aid, chat_id, reply)
+        else
+            bus_mod.makeOutbound(allocator, channel, chat_id, reply);
+    }
+
+    var parsed = try interaction_choices.parseAssistantChoices(allocator, reply);
+    defer parsed.deinit(allocator);
+
+    if (parsed.choices) |choices| {
+        return if (account_id) |aid|
+            bus_mod.makeOutboundWithAccountChoices(allocator, channel, aid, chat_id, parsed.visible_text, choices.options)
+        else
+            bus_mod.makeOutboundWithChoices(allocator, channel, chat_id, parsed.visible_text, choices.options);
+    }
+
+    return if (account_id) |aid|
+        bus_mod.makeOutboundWithAccount(allocator, channel, aid, chat_id, parsed.visible_text)
+    else
+        bus_mod.makeOutbound(allocator, channel, chat_id, parsed.visible_text);
 }
 
 fn makeStreamingSinkForChannel(
@@ -773,10 +826,13 @@ fn inboundDispatcherThread(
         };
         defer allocator.free(reply);
 
-        const out = (if (outbound_account_id) |aid|
-            bus_mod.makeOutboundWithAccount(allocator, msg.channel, aid, msg.chat_id, reply)
-        else
-            bus_mod.makeOutbound(allocator, msg.channel, msg.chat_id, reply)) catch |err| {
+        const out = makeAssistantReplyOutbound(
+            allocator,
+            msg.channel,
+            outbound_account_id,
+            msg.chat_id,
+            reply,
+        ) catch |err| {
             log.err("inbound dispatch makeOutbound failed: {}", .{err});
             continue;
         };
@@ -1042,6 +1098,19 @@ test "makeStreamingSinkForChannel filters web chunks" {
 
     try std.testing.expectEqualStrings("AB", collector.text());
     try std.testing.expect(collector.got_final);
+}
+
+test "makeStreamingSinkForChannel supports dingtalk" {
+    const Noop = struct {
+        fn callback(_: *anyopaque, _: streaming.Event) void {}
+    };
+
+    var filter: streaming.TagFilter = undefined;
+    const sink = makeStreamingSinkForChannel("dingtalk", .{
+        .callback = Noop.callback,
+        .ctx = undefined,
+    }, &filter);
+    try std.testing.expect(sink != null);
 }
 
 test "makeStreamingSinkForChannel returns null for unsupported channel" {
@@ -1762,6 +1831,47 @@ test "resolveInboundRouteSessionKey supports standardized peer metadata for unkn
     try std.testing.expectEqualStrings("agent:custom-agent:custom:direct:user-7", routed.?);
 }
 
+test "resolveInboundRouteSessionKey uses telegram thread metadata for topic routing" {
+    const allocator = std.testing.allocator;
+    const bindings = [_]agent_routing.AgentBinding{
+        .{
+            .agent_id = "tg-topic-agent",
+            .match = .{
+                .channel = "telegram",
+                .account_id = "main",
+                .peer = .{ .kind = .group, .id = "-100123:thread:42" },
+            },
+        },
+        .{
+            .agent_id = "tg-group-agent",
+            .match = .{
+                .channel = "telegram",
+                .account_id = "main",
+                .peer = .{ .kind = .group, .id = "-100123" },
+            },
+        },
+    };
+    const config = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .agent_bindings = &bindings,
+    };
+    const msg = bus_mod.InboundMessage{
+        .channel = "telegram",
+        .sender_id = "user-1",
+        .chat_id = "-100123#topic:42",
+        .content = "hello",
+        .session_key = "telegram:-100123#topic:42",
+        .metadata_json = "{\"account_id\":\"main\",\"peer_kind\":\"group\",\"peer_id\":\"-100123\",\"thread_id\":\"42\"}",
+    };
+
+    const routed = resolveInboundRouteSessionKey(allocator, &config, &msg);
+    try std.testing.expect(routed != null);
+    defer allocator.free(routed.?);
+    try std.testing.expectEqualStrings("agent:tg-topic-agent:telegram:group:-100123:thread:42", routed.?);
+}
+
 test "parseInboundMetadata extracts message_id and thread_id" {
     var parsed = parseInboundMetadata(
         std.testing.allocator,
@@ -1773,6 +1883,32 @@ test "parseInboundMetadata extracts message_id and thread_id" {
     try std.testing.expectEqualStrings("C1", parsed.fields.channel_id.?);
     try std.testing.expectEqualStrings("1700.1", parsed.fields.message_id.?);
     try std.testing.expectEqualStrings("1700.0", parsed.fields.thread_id.?);
+}
+
+test "makeAssistantReplyOutbound preserves plain replies without choices" {
+    const allocator = std.testing.allocator;
+    var msg = try makeAssistantReplyOutbound(allocator, "telegram", null, "chat1", "hello");
+    defer msg.deinit(allocator);
+
+    try std.testing.expectEqualStrings("hello", msg.content);
+    try std.testing.expectEqual(@as(usize, 0), msg.choices.len);
+    try std.testing.expect(msg.account_id == null);
+}
+
+test "makeAssistantReplyOutbound extracts structured choices from assistant reply" {
+    const allocator = std.testing.allocator;
+    const reply =
+        \\Choose one:
+        \\<nc_choices>{"v":1,"options":[{"id":"yes","label":"Yes","submit_text":"yes"},{"id":"no","label":"No"}]}</nc_choices>
+    ;
+    var msg = try makeAssistantReplyOutbound(allocator, "telegram", "backup", "chat1", reply);
+    defer msg.deinit(allocator);
+
+    try std.testing.expectEqualStrings("backup", msg.account_id.?);
+    try std.testing.expectEqualStrings("Choose one:\n", msg.content);
+    try std.testing.expectEqual(@as(usize, 2), msg.choices.len);
+    try std.testing.expectEqualStrings("yes", msg.choices[0].id);
+    try std.testing.expectEqualStrings("No", msg.choices[1].label);
 }
 
 test "resolveSlackStatusTarget prefers thread_id then falls back to message_id" {
