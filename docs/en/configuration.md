@@ -159,6 +159,97 @@ Notes:
   }
 }
 ```
+
+### Subagent Profiles + Routing (Practical Pattern)
+
+Use this pattern when you want one "orchestrator" agent to delegate specialized tasks:
+
+1. Define reusable specialists under `agents.list`.
+2. Keep a general default under `agents.defaults`.
+3. Use `bindings` to route specific chats/topics to a specialist.
+4. Use `/delegate <agent-id> <task>` when you want explicit one-off delegation.
+
+Example:
+
+```json
+{
+  "agents": {
+    "defaults": {
+      "model": { "primary": "openrouter/anthropic/claude-sonnet-4" }
+    },
+    "list": [
+      {
+        "id": "orchestrator",
+        "model": { "primary": "openrouter/anthropic/claude-sonnet-4" },
+        "system_prompt": "Coordinate tasks and delegate to specialists."
+      },
+      {
+        "id": "coder",
+        "model": { "primary": "openrouter/qwen/qwen3-coder" },
+        "system_prompt": "You are focused on implementation and tests."
+      },
+      {
+        "id": "researcher",
+        "model": { "primary": "openrouter/openai/gpt-4.1" },
+        "system_prompt": "You are focused on investigation and synthesis."
+      }
+    ]
+  }
+}
+```
+
+Notes:
+
+- `agents.list[].id` is the value used by `/delegate` and by `bindings[].agent_id`.
+- Prefer short stable ids (`coder`, `researcher`) so chat commands stay simple.
+- Keep specialist prompts narrow; broad prompts overlap and reduce routing clarity.
+
+### `identity` (AIEOS v1.1)
+
+Use this section when you want the runtime identity to come from an AIEOS document:
+
+```json
+{
+  "identity": {
+    "format": "aieos",
+    "aieos_path": "./identity/aieos.identity.json"
+  }
+}
+```
+
+You can also inline the same document directly in config:
+
+```json
+{
+  "identity": {
+    "format": "aieos",
+    "aieos_inline": "{\"version\":\"1.1\",\"agent\":{\"name\":\"nullclaw-assistant\",\"description\":\"General purpose assistant\"},\"user\":{\"name\":\"operator\",\"timezone\":\"UTC+08:00\"}}"
+  }
+}
+```
+
+Minimal AIEOS v1.1 example file (`identity/aieos.identity.json`):
+
+```json
+{
+  "version": "1.1",
+  "agent": {
+    "name": "nullclaw-assistant",
+    "description": "General-purpose autonomous assistant"
+  },
+  "user": {
+    "name": "operator",
+    "timezone": "UTC+08:00"
+  }
+}
+```
+
+Notes:
+
+- Prefer `aieos_path` for maintainability and version control readability.
+- Use `aieos_inline` only when you need a fully self-contained single config file.
+- Keep `identity.format` aligned with the payload source (`aieos`).
+
 ### `channels`
 
 - Channel config lives under `channels.<name>`.
