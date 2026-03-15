@@ -845,6 +845,9 @@ pub const QQChannel = struct {
     }
 
     pub fn healthCheck(self: *QQChannel) bool {
+        if (self.config.receive_mode == .websocket) {
+            return self.running.load(.acquire) and self.ws_fd.load(.acquire) != invalid_socket;
+        }
         const result = fetchAccessToken(self.allocator, self.config.app_id, self.config.app_secret) catch return false;
         self.allocator.free(result.token);
         return true;
@@ -2127,6 +2130,18 @@ test "qq QQChannel init stores config" {
     try std.testing.expect(ch.healthCheck());
     try std.testing.expect(!ch.has_sequence.load(.acquire));
     try std.testing.expectEqual(@as(u32, 0), ch.heartbeat_interval_ms.load(.acquire));
+}
+
+test "qq healthCheck websocket requires running socket" {
+    const alloc = std.testing.allocator;
+    var ch = QQChannel.init(alloc, .{ .receive_mode = .websocket });
+    try std.testing.expect(!ch.healthCheck());
+
+    ch.running.store(true, .release);
+    try std.testing.expect(!ch.healthCheck());
+
+    ch.ws_fd.store(42, .release);
+    try std.testing.expect(ch.healthCheck());
 }
 
 test "qq QQChannel vtable compiles" {
