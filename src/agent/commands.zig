@@ -535,6 +535,78 @@ test "hotApplyConfigChange updates agent status_show_emojis" {
     try std.testing.expect(!dummy.status_show_emojis);
 }
 
+test "applyHotReloadConfig restores resolved defaults and invalidates prompt cache" {
+    const allocator = std.testing.allocator;
+
+    var dummy = struct {
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        model_name_owned: bool,
+        default_provider: []const u8,
+        default_provider_owned: bool,
+        default_model: []const u8,
+        temperature: f64,
+        max_tool_iterations: u32,
+        max_history_messages: u32,
+        message_timeout_secs: u64,
+        status_show_emojis: bool,
+        has_system_prompt: bool,
+        system_prompt_has_conversation_context: bool,
+        workspace_prompt_fingerprint: ?u64,
+        system_prompt_model_name: ?[]u8,
+    }{
+        .allocator = allocator,
+        .model_name = "stale-model",
+        .model_name_owned = false,
+        .default_provider = "stale-provider",
+        .default_provider_owned = false,
+        .default_model = "stale-model",
+        .temperature = 1.5,
+        .max_tool_iterations = 1,
+        .max_history_messages = 2,
+        .message_timeout_secs = 3,
+        .status_show_emojis = false,
+        .has_system_prompt = true,
+        .system_prompt_has_conversation_context = true,
+        .workspace_prompt_fingerprint = 1234,
+        .system_prompt_model_name = try allocator.dupe(u8, "stale-model"),
+    };
+    defer if (dummy.model_name_owned) allocator.free(dummy.model_name);
+    defer if (dummy.default_provider_owned) allocator.free(dummy.default_provider);
+    defer if (dummy.system_prompt_model_name) |model_name| allocator.free(model_name);
+
+    var cfg = config_module.Config{
+        .workspace_dir = "/tmp/nullclaw-test",
+        .config_path = "/tmp/nullclaw-test/config.json",
+        .default_provider = "openrouter",
+        .default_model = "gpt-4o",
+        .allocator = allocator,
+    };
+    cfg.agent.max_tool_iterations = 1000;
+    cfg.agent.max_history_messages = 100;
+    cfg.agent.message_timeout_secs = 600;
+    cfg.agent.status_show_emojis = true;
+
+    const summary = try applyHotReloadConfig(&dummy, &cfg);
+    try std.testing.expectEqual(@as(usize, 6), summary.attempted);
+    try std.testing.expectEqual(@as(usize, 6), summary.applied);
+    try std.testing.expectEqual(@as(usize, 0), summary.skipped);
+    try std.testing.expectEqual(@as(usize, 0), summary.failed);
+
+    try std.testing.expectEqualStrings("gpt-4o", dummy.model_name);
+    try std.testing.expectEqualStrings("gpt-4o", dummy.default_model);
+    try std.testing.expectEqualStrings("openrouter", dummy.default_provider);
+    try std.testing.expectEqual(@as(f64, 0.7), dummy.temperature);
+    try std.testing.expectEqual(@as(u32, 1000), dummy.max_tool_iterations);
+    try std.testing.expectEqual(@as(u32, 100), dummy.max_history_messages);
+    try std.testing.expectEqual(@as(u64, 600), dummy.message_timeout_secs);
+    try std.testing.expect(dummy.status_show_emojis);
+    try std.testing.expect(!dummy.has_system_prompt);
+    try std.testing.expect(!dummy.system_prompt_has_conversation_context);
+    try std.testing.expect(dummy.workspace_prompt_fingerprint == null);
+    try std.testing.expect(dummy.system_prompt_model_name == null);
+}
+
 test "splitPrimaryModelRef parses provider model format" {
     const parsed = splitPrimaryModelRef("openrouter/inception/mercury") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("openrouter", parsed.provider);
@@ -2300,6 +2372,22 @@ fn splitPrimaryModelRef(primary: []const u8) ?struct { provider: []const u8, mod
     };
 }
 
+const hot_reload_paths = [_][]const u8{
+    "agents.defaults.model.primary",
+    "default_temperature",
+    "agent.max_tool_iterations",
+    "agent.max_history_messages",
+    "agent.message_timeout_secs",
+    "agent.status_show_emojis",
+};
+
+const HotReloadSummary = struct {
+    attempted: usize = 0,
+    applied: usize = 0,
+    skipped: usize = 0,
+    failed: usize = 0,
+};
+
 fn hotApplyConfigChange(
     self: anytype,
     action: config_mutator.MutationAction,
@@ -2366,6 +2454,122 @@ fn hotApplyConfigChange(
     }
 
     return false;
+}
+
+fn loadHotReloadConfig(backing_allocator: std.mem.Allocator) !config_module.Config {
+    const arena_ptr = try backing_allocator.create(std.heap.ArenaAllocator);
+    arena_ptr.* = std.heap.ArenaAllocator.init(backing_allocator);
+    errdefer {
+        arena_ptr.deinit();
+        backing_allocator.destroy(arena_ptr);
+    }
+    const allocator = arena_ptr.allocator();
+
+    const config_path = try config_mutator.defaultConfigPath(allocator);
+    const config_dir = std.fs.path.dirname(config_path) orelse return error.InvalidPath;
+    const default_workspace_dir = try std.fs.path.join(allocator, &.{ config_dir, "workspace" });
+
+    var cfg = config_module.Config{
+        .workspace_dir = default_workspace_dir,
+        .config_path = config_path,
+        .allocator = allocator,
+        .arena = arena_ptr,
+    };
+
+    if (std.fs.openFileAbsolute(config_path, .{})) |file| {
+        defer file.close();
+        const content = try file.readToEndAlloc(allocator, 1024 * 64);
+        try cfg.parseJson(content);
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    }
+
+    if (cfg.workspace_dir_override != null) {
+        cfg.workspace_dir = cfg.workspace_dir_override.?;
+    }
+
+    if (cfg.channels.nostr) |ns| {
+        ns.config_dir = std.fs.path.dirname(config_path) orelse ".";
+    }
+    {
+        const dir = std.fs.path.dirname(config_path) orelse ".";
+        const teams_mut = @constCast(cfg.channels.teams);
+        for (teams_mut) |*tc| {
+            tc.config_dir = dir;
+        }
+    }
+
+    cfg.applyEnvOverrides();
+    cfg.syncFlatFields();
+    return cfg;
+}
+
+fn hotReloadValueJson(
+    allocator: std.mem.Allocator,
+    cfg: *const config_module.Config,
+    path: []const u8,
+) ![]u8 {
+    if (std.mem.eql(u8, path, "agents.defaults.model.primary")) {
+        const model = cfg.default_model orelse return try allocator.dupe(u8, "null");
+        return try std.fmt.allocPrint(allocator, "\"{s}/{s}\"", .{ cfg.default_provider, model });
+    }
+
+    if (std.mem.eql(u8, path, "default_temperature")) {
+        return try std.fmt.allocPrint(allocator, "{d}", .{cfg.default_temperature});
+    }
+
+    if (std.mem.eql(u8, path, "agent.max_tool_iterations")) {
+        return try std.fmt.allocPrint(allocator, "{d}", .{cfg.agent.max_tool_iterations});
+    }
+
+    if (std.mem.eql(u8, path, "agent.max_history_messages")) {
+        return try std.fmt.allocPrint(allocator, "{d}", .{cfg.agent.max_history_messages});
+    }
+
+    if (std.mem.eql(u8, path, "agent.message_timeout_secs")) {
+        return try std.fmt.allocPrint(allocator, "{d}", .{cfg.agent.message_timeout_secs});
+    }
+
+    if (std.mem.eql(u8, path, "agent.status_show_emojis")) {
+        return try allocator.dupe(u8, if (cfg.agent.status_show_emojis) "true" else "false");
+    }
+
+    return error.InvalidPath;
+}
+
+fn applyHotReloadConfig(self: anytype, cfg: *const config_module.Config) !HotReloadSummary {
+    var summary = HotReloadSummary{};
+
+    for (hot_reload_paths) |path| {
+        const value_json = hotReloadValueJson(self.allocator, cfg, path) catch {
+            summary.failed += 1;
+            continue;
+        };
+        defer self.allocator.free(value_json);
+
+        if (std.mem.eql(u8, std.mem.trim(u8, value_json, " \t\r\n"), "null")) {
+            summary.skipped += 1;
+            continue;
+        }
+
+        summary.attempted += 1;
+        const hot_applied = hotApplyConfigChange(self, .set, path, value_json) catch {
+            summary.failed += 1;
+            continue;
+        };
+        if (hot_applied) {
+            summary.applied += 1;
+        } else {
+            summary.skipped += 1;
+        }
+    }
+
+    if (summary.applied > 0) {
+        invalidateSystemPromptCache(self);
+    }
+
+    return summary;
 }
 
 fn formatConfigMutationResponse(
@@ -2471,58 +2675,30 @@ fn handleConfigCommand(self: anytype, arg: []const u8) ![]const u8 {
 
         var validation_failed = false;
         config_mutator.validateCurrentConfig(self.allocator) catch {
-            // Some CI/test environments may not have a fully materialized
-            // ~/.nullclaw/config.json. Keep reload best-effort and report it.
             validation_failed = true;
         };
 
-        const hot_reload_paths = [_][]const u8{
-            "agents.defaults.model.primary",
-            "default_temperature",
-            "agent.max_tool_iterations",
-            "agent.max_history_messages",
-            "agent.message_timeout_secs",
-            "agent.status_show_emojis",
-        };
-
-        var attempted: usize = 0;
-        var applied: usize = 0;
-        var skipped: usize = 0;
-        var failed: usize = 0;
-        if (validation_failed) failed += 1;
-
-        for (hot_reload_paths) |path| {
-            const value_json = config_mutator.getPathValueJson(self.allocator, path) catch {
-                failed += 1;
-                continue;
+        var summary = HotReloadSummary{};
+        if (validation_failed) {
+            summary.failed = 1;
+        } else {
+            var cfg = loadHotReloadConfig(self.allocator) catch {
+                summary.failed = 1;
+                return try std.fmt.allocPrint(
+                    self.allocator,
+                    "Config hot reload complete: attempted={d} applied={d} skipped={d} failed={d} validation_failed={s}",
+                    .{ summary.attempted, summary.applied, summary.skipped, summary.failed, "false" },
+                );
             };
-            defer self.allocator.free(value_json);
+            defer cfg.deinit();
 
-            if (std.mem.eql(u8, std.mem.trim(u8, value_json, " \t\r\n"), "null")) {
-                skipped += 1;
-                continue;
-            }
-
-            attempted += 1;
-            const hot_applied = hotApplyConfigChange(self, .set, path, value_json) catch {
-                failed += 1;
-                continue;
-            };
-            if (hot_applied) {
-                applied += 1;
-            } else {
-                skipped += 1;
-            }
-        }
-
-        if (applied > 0) {
-            invalidateSystemPromptCache(self);
+            summary = try applyHotReloadConfig(self, &cfg);
         }
 
         return try std.fmt.allocPrint(
             self.allocator,
             "Config hot reload complete: attempted={d} applied={d} skipped={d} failed={d} validation_failed={s}",
-            .{ attempted, applied, skipped, failed, if (validation_failed) "true" else "false" },
+            .{ summary.attempted, summary.applied, summary.skipped, summary.failed, if (validation_failed) "true" else "false" },
         );
     }
 
