@@ -59,6 +59,19 @@ pub fn buildAddBody(
         if (cfg.to) |value| {
             try appendBodyField(&body_buf, allocator, &wrote_field, "delivery_to", value);
         }
+        if (cfg.peer_kind) |value| {
+            try appendBodyField(&body_buf, allocator, &wrote_field, "delivery_peer_kind", switch (value) {
+                .direct => "direct",
+                .group => "group",
+                .channel => "channel",
+            });
+        }
+        if (cfg.peer_id) |value| {
+            try appendBodyField(&body_buf, allocator, &wrote_field, "delivery_peer_id", value);
+        }
+        if (cfg.thread_id) |value| {
+            try appendBodyField(&body_buf, allocator, &wrote_field, "delivery_thread_id", value);
+        }
         if (!cfg.best_effort) {
             try appendBodyLiteral(&body_buf, allocator, &wrote_field, "\"delivery_best_effort\":false");
         }
@@ -161,6 +174,9 @@ test "buildAddBody includes delivery fields" {
             .channel = "telegram",
             .account_id = "backup",
             .to = "chat-7",
+            .peer_kind = .group,
+            .peer_id = "-100123",
+            .thread_id = "77",
             .best_effort = false,
         },
         .main,
@@ -176,6 +192,9 @@ test "buildAddBody includes delivery fields" {
     try std.testing.expectEqualStrings("telegram", parsed.value.object.get("delivery_channel").?.string);
     try std.testing.expectEqualStrings("backup", parsed.value.object.get("delivery_account_id").?.string);
     try std.testing.expectEqualStrings("chat-7", parsed.value.object.get("delivery_to").?.string);
+    try std.testing.expectEqualStrings("group", parsed.value.object.get("delivery_peer_kind").?.string);
+    try std.testing.expectEqualStrings("-100123", parsed.value.object.get("delivery_peer_id").?.string);
+    try std.testing.expectEqualStrings("77", parsed.value.object.get("delivery_thread_id").?.string);
     try std.testing.expect(!parsed.value.object.get("delivery_best_effort").?.bool);
 }
 

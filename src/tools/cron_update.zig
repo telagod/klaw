@@ -34,7 +34,8 @@ pub const CronUpdateTool = struct {
         const prompt = root.getString(args, "prompt");
         const model = root.getString(args, "model");
         const session_target = if (root.getString(args, "session_target")) |raw|
-            cron.SessionTarget.parse(raw)
+            cron.SessionTarget.parseStrict(raw) catch
+                return ToolResult.fail("Invalid 'session_target' parameter: expected 'isolated' or 'main'")
         else
             null;
         const enabled = root.getBool(args, "enabled");
@@ -67,6 +68,16 @@ pub const CronUpdateTool = struct {
             return ToolResult.fail("Failed to load scheduler state");
         };
         defer scheduler.deinit();
+
+        if (session_target != null) {
+            const existing = scheduler.getJob(job_id) orelse {
+                const msg = try std.fmt.allocPrint(allocator, "Job '{s}' not found", .{job_id});
+                return ToolResult{ .success = false, .output = "", .error_msg = msg };
+            };
+            if (existing.job_type != .agent) {
+                return ToolResult.fail("session_target requires an agent job");
+            }
+        }
 
         const patch = cron.CronJobPatch{
             .expression = expression,
@@ -197,6 +208,16 @@ test "cron_update_invalid_expression" {
     const result = try t.execute(std.testing.allocator, parsed.value.object);
     try std.testing.expect(!result.success);
     try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "Invalid cron expression") != null);
+}
+
+test "cron_update rejects invalid session_target" {
+    var ct = CronUpdateTool{};
+    const t = ct.tool();
+    const parsed = try root.parseTestArgs("{\"job_id\": \"job-1\", \"session_target\": \"primary\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "session_target") != null);
 }
 
 test "cron_update gateway request body keeps enabled false" {
