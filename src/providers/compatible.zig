@@ -601,6 +601,44 @@ pub const OpenAiCompatibleProvider = struct {
         ctx.state.feed(chunk.delta, ctx.downstream, ctx.downstream_ctx);
     }
 
+    fn extractMessageText(allocator: std.mem.Allocator, msg_obj: std.json.ObjectMap) !?[]const u8 {
+        const content = msg_obj.get("content") orelse return null;
+
+        switch (content) {
+            .string => {
+                const trimmed = std.mem.trim(u8, content.string, " \t\n\r");
+                if (trimmed.len == 0) return null;
+                return try allocator.dupe(u8, trimmed);
+            },
+            .array => {
+                var text_parts: std.ArrayListUnmanaged(u8) = .empty;
+                defer text_parts.deinit(allocator);
+
+                for (content.array.items) |part| {
+                    var candidate: ?[]const u8 = null;
+                    switch (part) {
+                        .string => candidate = part.string,
+                        .object => {
+                            if (part.object.get("text")) |text| {
+                                if (text == .string) candidate = text.string;
+                            }
+                        },
+                        else => {},
+                    }
+
+                    if (candidate) |text_value| {
+                        try text_parts.appendSlice(allocator, text_value);
+                    }
+                }
+
+                const trimmed = std.mem.trim(u8, text_parts.items, " \t\n\r");
+                if (trimmed.len == 0) return null;
+                return try allocator.dupe(u8, trimmed);
+            },
+            else => return null,
+        }
+    }
+
     /// Parse text content from an OpenAI-compatible response.
     pub fn parseTextResponse(allocator: std.mem.Allocator, body: []const u8) ![]const u8 {
         const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
@@ -620,10 +658,11 @@ pub const OpenAiCompatibleProvider = struct {
         if (root_obj.get("choices")) |choices| {
             if (choices.array.items.len > 0) {
                 if (choices.array.items[0].object.get("message")) |msg| {
-                    if (msg.object.get("content")) |content| {
-                        if (content == .string) {
-                            return stripThinkBlocks(allocator, content.string);
-                        }
+                    const msg_obj = msg.object;
+
+                    if (try extractMessageText(allocator, msg_obj)) |text| {
+                        defer allocator.free(text);
+                        return stripThinkBlocks(allocator, text);
                     }
                 }
             }
@@ -654,13 +693,14 @@ pub const OpenAiCompatibleProvider = struct {
                 const msg_obj = msg.object;
 
                 var content: ?[]const u8 = null;
+                errdefer if (content) |c| if (c.len > 0) allocator.free(c);
                 var reasoning_content: ?[]const u8 = null;
-                if (msg_obj.get("content")) |c| {
-                    if (c == .string) {
-                        const split = try splitThinkContent(allocator, c.string);
-                        content = split.visible;
-                        reasoning_content = split.reasoning;
-                    }
+                errdefer if (reasoning_content) |rc| if (rc.len > 0) allocator.free(rc);
+                if (try extractMessageText(allocator, msg_obj)) |message_text| {
+                    defer allocator.free(message_text);
+                    const split = try splitThinkContent(allocator, message_text);
+                    content = split.visible;
+                    reasoning_content = split.reasoning;
                 }
                 // Fallback: some providers return reasoning in native fields.
                 // - Z.AI/GLM: `reasoning_content`
@@ -679,6 +719,14 @@ pub const OpenAiCompatibleProvider = struct {
                 }
 
                 var tool_calls_list: std.ArrayListUnmanaged(ToolCall) = .empty;
+                errdefer {
+                    for (tool_calls_list.items) |tc| {
+                        if (tc.id.len > 0) allocator.free(tc.id);
+                        if (tc.name.len > 0) allocator.free(tc.name);
+                        if (tc.arguments.len > 0) allocator.free(tc.arguments);
+                    }
+                    tool_calls_list.deinit(allocator);
+                }
 
                 if (msg_obj.get("tool_calls")) |tc_arr| {
                     for (tc_arr.array.items) |tc| {
@@ -699,6 +747,19 @@ pub const OpenAiCompatibleProvider = struct {
                     }
                 }
 
+                // Treat a response with no content, no tool calls, and no reasoning as empty.
+                // This happens when the model hits its context limit and returns finish_reason=length
+                // with a null or empty content field. Returning NoResponseContent here lets the
+                // agent's empty-response retry and model-fallback logic engage rather than
+                // silently succeeding with nothing to show.
+                const has_content = content != null and content.?.len > 0;
+                const has_tools = tool_calls_list.items.len > 0;
+                const has_reasoning = reasoning_content != null and reasoning_content.?.len > 0;
+                if (!has_content and !has_tools and !has_reasoning) {
+                    log.warn("parseNativeResponse: response has no content, tool calls, or reasoning; treating as NoResponseContent", .{});
+                    return error.NoResponseContent;
+                }
+
                 var usage = TokenUsage{};
                 if (root_obj.get("usage")) |usage_obj| {
                     if (usage_obj == .object) {
@@ -714,11 +775,22 @@ pub const OpenAiCompatibleProvider = struct {
                     }
                 }
 
+                const owned_tool_calls = try tool_calls_list.toOwnedSlice(allocator);
+                errdefer {
+                    for (owned_tool_calls) |tc| {
+                        if (tc.id.len > 0) allocator.free(tc.id);
+                        if (tc.name.len > 0) allocator.free(tc.name);
+                        if (tc.arguments.len > 0) allocator.free(tc.arguments);
+                    }
+                    if (owned_tool_calls.len > 0) allocator.free(owned_tool_calls);
+                }
+
                 const model_str = if (root_obj.get("model")) |m| (if (m == .string) try allocator.dupe(u8, m.string) else try allocator.dupe(u8, "")) else try allocator.dupe(u8, "");
+                errdefer if (model_str.len > 0) allocator.free(model_str);
 
                 return .{
                     .content = content,
-                    .tool_calls = try tool_calls_list.toOwnedSlice(allocator),
+                    .tool_calls = owned_tool_calls,
                     .usage = usage,
                     .model = model_str,
                     .reasoning_content = reasoning_content,
@@ -1323,6 +1395,96 @@ test "parseNativeResponse reads native reasoning field (Groq/Cerebras parsed for
     try std.testing.expectEqualStrings("parsed reasoning trace", result.reasoning_content.?);
 }
 
+test "parseNativeResponse supports content array text parts" {
+    const body =
+        \\{"choices":[{"message":{"content":[{"type":"text","text":"Hello "},{"type":"text","text":"from kimi-k2.5"}]}}],"model":"kimi-k2.5"}
+    ;
+    const result = try OpenAiCompatibleProvider.parseNativeResponse(std.testing.allocator, body);
+    defer {
+        if (result.content) |c| if (c.len > 0) std.testing.allocator.free(c);
+        for (result.tool_calls) |tc| {
+            if (tc.id.len > 0) std.testing.allocator.free(tc.id);
+            if (tc.name.len > 0) std.testing.allocator.free(tc.name);
+            if (tc.arguments.len > 0) std.testing.allocator.free(tc.arguments);
+        }
+        if (result.tool_calls.len > 0) std.testing.allocator.free(result.tool_calls);
+        if (result.model.len > 0) std.testing.allocator.free(result.model);
+        if (result.reasoning_content) |rc| if (rc.len > 0) std.testing.allocator.free(rc);
+    }
+    try std.testing.expect(result.content != null);
+    try std.testing.expectEqualStrings("Hello from kimi-k2.5", result.content.?);
+    try std.testing.expect(result.reasoning_content == null);
+}
+
+test "parseNativeResponse null content with no tools or reasoning returns NoResponseContent" {
+    // Simulates GLM-5 hitting its context limit: finish_reason=length, content=null.
+    // All three payloads (content, tool_calls, reasoning_content) are absent/empty.
+    // parseNativeResponse must return NoResponseContent so the agent's retry/fallback chain engages.
+    const body =
+        \\{"choices":[{"message":{"content":null},"finish_reason":"length"}],"model":"glm-5"}
+    ;
+    try std.testing.expectError(
+        error.NoResponseContent,
+        OpenAiCompatibleProvider.parseNativeResponse(std.testing.allocator, body),
+    );
+}
+
+test "parseNativeResponse empty string content with no tools or reasoning returns NoResponseContent" {
+    const body =
+        \\{"choices":[{"message":{"content":""},"finish_reason":"length"}],"model":"glm-5"}
+    ;
+    try std.testing.expectError(
+        error.NoResponseContent,
+        OpenAiCompatibleProvider.parseNativeResponse(std.testing.allocator, body),
+    );
+}
+
+test "parseNativeResponse null content with reasoning_content succeeds" {
+    // Reasoning-only response (thinking model that produced a CoT but no final text) is valid.
+    const body =
+        \\{"choices":[{"message":{"content":null,"reasoning_content":"step-by-step reasoning here"}}],"model":"glm-z1"}
+    ;
+    const result = try OpenAiCompatibleProvider.parseNativeResponse(std.testing.allocator, body);
+    defer {
+        if (result.content) |c| if (c.len > 0) std.testing.allocator.free(c);
+        for (result.tool_calls) |tc| {
+            if (tc.id.len > 0) std.testing.allocator.free(tc.id);
+            if (tc.name.len > 0) std.testing.allocator.free(tc.name);
+            if (tc.arguments.len > 0) std.testing.allocator.free(tc.arguments);
+        }
+        if (result.tool_calls.len > 0) std.testing.allocator.free(result.tool_calls);
+        if (result.model.len > 0) std.testing.allocator.free(result.model);
+        if (result.reasoning_content) |rc| if (rc.len > 0) std.testing.allocator.free(rc);
+    }
+    try std.testing.expect(result.content == null);
+    try std.testing.expect(result.reasoning_content != null);
+    try std.testing.expectEqualStrings("step-by-step reasoning here", result.reasoning_content.?);
+}
+
+test "parseNativeResponse null content with native tool calls succeeds" {
+    // Models that emit tool_calls with no text content are valid — the agent should
+    // execute the tool, not treat the response as empty.
+    const body =
+        \\{"choices":[{"message":{"content":null,"tool_calls":[{"id":"call-1","function":{"name":"list_dir","arguments":"{\"path\":\"/tmp\"}"}}]}}],"model":"glm-5"}
+    ;
+    const result = try OpenAiCompatibleProvider.parseNativeResponse(std.testing.allocator, body);
+    defer {
+        if (result.content) |c| if (c.len > 0) std.testing.allocator.free(c);
+        for (result.tool_calls) |tc| {
+            if (tc.id.len > 0) std.testing.allocator.free(tc.id);
+            if (tc.name.len > 0) std.testing.allocator.free(tc.name);
+            if (tc.arguments.len > 0) std.testing.allocator.free(tc.arguments);
+        }
+        if (result.tool_calls.len > 0) std.testing.allocator.free(result.tool_calls);
+        if (result.model.len > 0) std.testing.allocator.free(result.model);
+        if (result.reasoning_content) |rc| if (rc.len > 0) std.testing.allocator.free(rc);
+    }
+    try std.testing.expect(result.content == null);
+    try std.testing.expect(result.tool_calls.len == 1);
+    try std.testing.expectEqualStrings("list_dir", result.tool_calls[0].name);
+    try std.testing.expectEqualStrings("call-1", result.tool_calls[0].id);
+}
+
 test "buildChatRequestBody emits thinking param for GLM when reasoning_effort set" {
     const allocator = std.testing.allocator;
     const msgs = [_]root.ChatMessage{root.ChatMessage.user("test")};
@@ -1548,6 +1710,22 @@ test "parseTextResponse with null content fails" {
         \\{"choices":[{"message":{"content":null}}]}
     ;
     try std.testing.expectError(error.NoResponseContent, OpenAiCompatibleProvider.parseTextResponse(std.testing.allocator, body));
+}
+
+test "parseTextResponse does not surface reasoning_content as visible content" {
+    const body =
+        \\{"choices":[{"message":{"content":null,"reasoning_content":"private chain of thought"}}]}
+    ;
+    try std.testing.expectError(error.NoResponseContent, OpenAiCompatibleProvider.parseTextResponse(std.testing.allocator, body));
+}
+
+test "parseTextResponse supports content array text parts" {
+    const body =
+        \\{"choices":[{"message":{"content":[{"type":"text","text":"Hello "},{"type":"text","text":"from kimi-k2.5"}]}}]}
+    ;
+    const result = try OpenAiCompatibleProvider.parseTextResponse(std.testing.allocator, body);
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("Hello from kimi-k2.5", result);
 }
 
 test "AuthStyle headerName" {

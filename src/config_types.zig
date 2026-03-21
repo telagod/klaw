@@ -54,7 +54,8 @@ pub const ProviderEntry = struct {
     /// skipped and a non-streaming POST is used instead.
     /// null means no limit — streaming is always attempted (recommended for
     /// modern LLMs with large context windows).
-    /// When set, must be > 0. Example: 524288 for 512 KiB.
+    /// When set, 0 forces the non-streaming path for every request and any
+    /// positive value applies that byte threshold. Example: 524288 for 512 KiB.
     max_streaming_prompt_bytes: ?usize = null,
 };
 
@@ -204,6 +205,9 @@ pub const AgentConfig = struct {
     status_show_emojis: bool = true,
     /// Max seconds to wait for an LLM HTTP response (curl --max-time). 0 = no limit.
     message_timeout_secs: u64 = 600,
+    /// Timezone label used for prompt date/time section.
+    /// Supported values: "UTC", "UTC+HH:MM", "UTC-HH:MM".
+    timezone: []const u8 = "UTC",
     /// Per-turn MCP tool filtering. Empty slice = no filtering (all tools included).
     /// See ToolFilterGroup for semantics.
     tool_filter_groups: []const ToolFilterGroup = &.{},
@@ -214,6 +218,28 @@ pub const AgentConfig = struct {
     /// When true, automatically adds the current model to vision_disabled_models
     /// upon receiving a "model does not support vision" error.
     auto_disable_vision_on_error: bool = true,
+
+    pub fn parseTimezoneOffsetSeconds(raw: []const u8) ?i64 {
+        if (std.ascii.eqlIgnoreCase(raw, "UTC")) return 0;
+        if (raw.len != 9) return null;
+        if (!std.ascii.eqlIgnoreCase(raw[0..3], "UTC")) return null;
+
+        const sign = raw[3];
+        if (sign != '+' and sign != '-') return null;
+        if (raw[6] != ':') return null;
+
+        const hours = std.fmt.parseInt(i64, raw[4..6], 10) catch return null;
+        const minutes = std.fmt.parseInt(i64, raw[7..9], 10) catch return null;
+        if (hours < 0 or hours > 23) return null;
+        if (minutes < 0 or minutes > 59) return null;
+
+        const total = hours * 3600 + minutes * 60;
+        return if (sign == '-') -total else total;
+    }
+
+    pub fn isValidTimezone(raw: []const u8) bool {
+        return parseTimezoneOffsetSeconds(raw) != null;
+    }
 };
 
 pub const ToolsConfig = struct {
@@ -480,6 +506,31 @@ pub const DingTalkConfig = struct {
     allow_from: []const []const u8 = &.{},
     ai_card_template_id: ?[]const u8 = null,
     ai_card_streaming_key: ?[]const u8 = null,
+};
+
+pub const WeChatConfig = struct {
+    account_id: []const u8 = "default",
+    /// Callback verification token used by WeChat signature check.
+    callback_token: []const u8,
+    /// WeChat EncodingAESKey (43 chars base64 sem padding) para callbacks seguros (encrypt_type=aes).
+    encoding_aes_key: ?[]const u8 = null,
+    /// Optional Official Account app id (reserved for outbound API support).
+    app_id: ?[]const u8 = null,
+    /// Optional Official Account app secret (reserved for outbound API support).
+    app_secret: ?[]const u8 = null,
+    allow_from: []const []const u8 = &.{},
+};
+
+pub const WeComConfig = struct {
+    account_id: []const u8 = "default",
+    webhook_url: []const u8,
+    /// Callback verification token (used to compute/verify msg_signature).
+    callback_token: ?[]const u8 = null,
+    /// WeCom EncodingAESKey (43 chars base64 without padding) used to decrypt callback payloads.
+    encoding_aes_key: ?[]const u8 = null,
+    /// Expected receiver ID (typically CorpID) for decrypted callback validation.
+    corp_id: ?[]const u8 = null,
+    allow_from: []const []const u8 = &.{},
 };
 
 pub const SignalConfig = struct {
@@ -819,6 +870,8 @@ pub const ChannelsConfig = struct {
     irc: []const IrcConfig = &.{},
     lark: []const LarkConfig = &.{},
     dingtalk: []const DingTalkConfig = &.{},
+    wechat: []const WeChatConfig = &.{},
+    wecom: []const WeComConfig = &.{},
     signal: []const SignalConfig = &.{},
     email: []const EmailConfig = &.{},
     line: []const LineConfig = &.{},
@@ -880,6 +933,12 @@ pub const ChannelsConfig = struct {
     }
     pub fn dingtalkPrimary(self: *const ChannelsConfig) ?DingTalkConfig {
         return primaryAccount(DingTalkConfig, self.dingtalk);
+    }
+    pub fn wechatPrimary(self: *const ChannelsConfig) ?WeChatConfig {
+        return primaryAccount(WeChatConfig, self.wechat);
+    }
+    pub fn wecomPrimary(self: *const ChannelsConfig) ?WeComConfig {
+        return primaryAccount(WeComConfig, self.wecom);
     }
     pub fn emailPrimary(self: *const ChannelsConfig) ?EmailConfig {
         return primaryAccount(EmailConfig, self.email);
@@ -1689,6 +1748,17 @@ test "WebConfig normalizePath trims and normalizes" {
     try std.testing.expectEqualStrings("/relay", WebConfig.normalizePath(" /relay/ "));
     try std.testing.expectEqualStrings(WebConfig.DEFAULT_PATH, WebConfig.normalizePath("relay"));
     try std.testing.expectEqualStrings(WebConfig.DEFAULT_PATH, WebConfig.normalizePath(""));
+}
+
+test "AgentConfig timezone validation accepts UTC and fixed offsets" {
+    try std.testing.expect(AgentConfig.isValidTimezone("UTC"));
+    try std.testing.expect(AgentConfig.isValidTimezone("UTC+05:30"));
+    try std.testing.expect(AgentConfig.isValidTimezone("UTC-03:00"));
+    try std.testing.expect(AgentConfig.isValidTimezone("utc+08:00"));
+
+    try std.testing.expect(!AgentConfig.isValidTimezone("Asia/Shanghai"));
+    try std.testing.expect(!AgentConfig.isValidTimezone("UTC+25:00"));
+    try std.testing.expect(!AgentConfig.isValidTimezone("UTC+08"));
 }
 
 test "WebConfig token validation enforces printable no-whitespace constraints" {
