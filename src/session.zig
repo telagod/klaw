@@ -217,6 +217,11 @@ pub const SessionManager = struct {
     policy: ?*const SecurityPolicy = null,
     subagent_manager: ?*@import("subagent.zig").SubagentManager = null,
 
+    /// Result of the startup vision probe against the configured model.
+    /// null = not yet probed (probe not run or skipped), true = model accepts images,
+    /// false = model rejected images (ProviderDoesNotSupportVision).
+    vision_capable: ?bool = null,
+
     mutex: std.Thread.Mutex,
     usage_log_mutex: std.Thread.Mutex,
     claim_state_io_mutex: std.Thread.Mutex,
@@ -317,6 +322,65 @@ pub const SessionManager = struct {
         self.claim_attempts.deinit(self.allocator);
 
         if (self.claim_state_path) |path| self.allocator.free(path);
+    }
+
+    /// Probe whether the configured model accepts image input by sending a minimal
+    /// 1×1 white JPEG directly to the provider (no session history, no tools).
+    /// Sets self.vision_capable to true/false accordingly; errors other than
+    /// ProviderDoesNotSupportVision are treated as "capable" (benefit of the doubt —
+    /// the model exists but returned a transient error; we'd rather not hide the
+    /// paperclip from the user). The result is cached — subsequent calls are no-ops.
+    pub fn probeVision(self: *SessionManager, allocator: std.mem.Allocator) void {
+        if (self.vision_capable != null) return;
+
+        const primary_model = self.config.default_model orelse {
+            log.info("vision probe: no default model configured, skipping", .{});
+            return;
+        };
+
+        // Minimal 1×1 white JPEG (~500 bytes) — sufficient to test vision acceptance
+        // without triggering expensive model compute.
+        const tiny_jpeg_b64 =
+            "/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8U" ++
+            "HRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/2wBDAQkJCQwLDBgN" ++
+            "DRgyIRwhMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIy" ++
+            "MjIyMjL/wAARCAABAAEDASIAAhEBAxEB/8QAFAABAAAAAAAAAAAAAAAAAAAACf/EABQQAQ" ++
+            "AAAAAAAAAAAAAAAAAAAP/EABQBAQAAAAAAAAAAAAAAAAAAAAD/xAAUEQEAAAAAAAAAAAAA" ++
+            "AAAAAAAA/9oADAMBAAIRAxEAPwCwABmX/9k=";
+
+        const content_parts = [_]providers.ContentPart{
+            .{ .text = "." },
+            .{ .image_base64 = .{ .data = tiny_jpeg_b64, .media_type = "image/jpeg" } },
+        };
+        const probe_msg = providers.ChatMessage{
+            .role = .user,
+            .content = ".",
+            .content_parts = &content_parts,
+        };
+        const probe_req = providers.ChatRequest{
+            .messages = &[_]providers.ChatMessage{probe_msg},
+            .model = primary_model,
+            .temperature = 0.0,
+            .max_tokens = 1,
+            .timeout_secs = 30,
+        };
+
+        log.info("vision probe: querying model '{s}' for image support", .{primary_model});
+        const resp = self.provider.chat(allocator, probe_req, primary_model, 0.0) catch |err| {
+            if (err == error.ProviderDoesNotSupportVision) {
+                log.info("vision probe: model '{s}' does not support vision", .{primary_model});
+                self.vision_capable = false;
+            } else {
+                // Transient error (network, rate limit, etc.) — assume capable.
+                log.info("vision probe: model '{s}' probe inconclusive ({s}), assuming capable", .{ primary_model, @errorName(err) });
+                self.vision_capable = true;
+            }
+            return;
+        };
+        if (resp.content) |c| allocator.free(c);
+        if (resp.reasoning_content) |c| allocator.free(c);
+        log.info("vision probe: model '{s}' confirmed vision support", .{primary_model});
+        self.vision_capable = true;
     }
 
     fn detectSubagentManager(tools: []const Tool) ?*@import("subagent.zig").SubagentManager {

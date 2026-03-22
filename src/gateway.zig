@@ -2155,11 +2155,11 @@ fn expectedHttpRequestSize(raw: []const u8) !?usize {
     return total;
 }
 
-fn configureRequestReadTimeout(stream: *std.net.Stream) void {
+fn configureRequestReadTimeout(stream: *std.net.Stream, timeout_secs: u64) void {
     if (!@hasDecl(std.posix.SO, "RCVTIMEO")) return;
 
     const timeout = std.posix.timeval{
-        .sec = @intCast(REQUEST_TIMEOUT_SECS),
+        .sec = @intCast(timeout_secs),
         .usec = 0,
     };
     std.posix.setsockopt(
@@ -5075,6 +5075,9 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                     tools_mod.bindMemoryRuntime(tools_slice, rt);
                 }
                 session_mgr_opt = sm;
+                // Eagerly probe whether the model accepts image input so we can
+                // advertise multi_modal capability in the agent card accurately.
+                session_mgr_opt.?.probeVision(allocator);
             }
         }
     } else {
@@ -5150,7 +5153,8 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
         };
         var close_conn = true;
         defer if (close_conn) conn.stream.close();
-        configureRequestReadTimeout(&conn.stream);
+        const req_timeout = if (config_opt) |c| c.gateway.request_timeout_secs else REQUEST_TIMEOUT_SECS;
+        configureRequestReadTimeout(&conn.stream, req_timeout);
 
         // Per-request arena — all request-scoped allocations freed in one shot
         var arena = std.heap.ArenaAllocator.init(allocator);
@@ -5264,7 +5268,8 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
             // A2A Agent Card discovery (public, no auth).
             if (config_opt) |cfg| {
                 if (cfg.a2a.enabled) {
-                    const card = a2a.handleAgentCard(req_allocator, cfg);
+                    const vision_capable = if (session_mgr_opt) |sm| sm.vision_capable else null;
+                    const card = a2a.handleAgentCard(req_allocator, cfg, vision_capable);
                     response_status = card.status;
                     response_body = card.body;
                 } else {
