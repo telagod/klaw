@@ -13,6 +13,7 @@ const config_mutator = @import("../config_mutator.zig");
 const context_tokens = @import("context_tokens.zig");
 const max_tokens_resolver = @import("max_tokens.zig");
 const control_plane = @import("../control_plane.zig");
+const model_refs = @import("../model_refs.zig");
 const provider_names = @import("../provider_names.zig");
 const version = @import("../version.zig");
 const command_summary = @import("../command_summary.zig");
@@ -570,6 +571,48 @@ test "hotApplyConfigChange model primary refreshes token and max token limits" {
     try std.testing.expectEqual(@as(u32, 8192), dummy.max_tokens);
 }
 
+test "hotApplyConfigChange updates custom url model primary" {
+    const allocator = std.testing.allocator;
+    var dummy = struct {
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        model_name_owned: bool,
+        default_provider: []const u8,
+        default_provider_owned: bool,
+        default_model: []const u8,
+        token_limit: u64,
+        token_limit_override: ?u64,
+        max_tokens: u32,
+        max_tokens_override: ?u32,
+    }{
+        .allocator = allocator,
+        .model_name = "old-model",
+        .model_name_owned = false,
+        .default_provider = "old-provider",
+        .default_provider_owned = false,
+        .default_model = "old-model",
+        .token_limit = 1024,
+        .token_limit_override = null,
+        .max_tokens = 128,
+        .max_tokens_override = null,
+    };
+    defer if (dummy.model_name_owned) allocator.free(dummy.model_name);
+    defer if (dummy.default_provider_owned) allocator.free(dummy.default_provider);
+
+    const applied = try hotApplyConfigChange(
+        &dummy,
+        .set,
+        "agents.defaults.model.primary",
+        "\"custom:https://api.example.com/openai/v2/qianfan/custom-model\"",
+    );
+    try std.testing.expect(applied);
+    try std.testing.expectEqualStrings("qianfan/custom-model", dummy.model_name);
+    try std.testing.expectEqualStrings("qianfan/custom-model", dummy.default_model);
+    try std.testing.expectEqualStrings("custom:https://api.example.com/openai/v2", dummy.default_provider);
+    try std.testing.expectEqual(@as(u64, 98_304), dummy.token_limit);
+    try std.testing.expectEqual(@as(u32, 32_768), dummy.max_tokens);
+}
+
 test "hotApplyConfigChange updates agent status_show_emojis" {
     const allocator = std.testing.allocator;
     var dummy = struct {
@@ -881,10 +924,17 @@ test "splitPrimaryModelRef parses provider model format" {
     try std.testing.expectEqualStrings("inception/mercury", parsed.model);
 }
 
+test "splitPrimaryModelRef parses custom url model format" {
+    const parsed = splitPrimaryModelRef("custom:https://api.example.com/openai/v2/qianfan/custom-model") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("custom:https://api.example.com/openai/v2", parsed.provider);
+    try std.testing.expectEqualStrings("qianfan/custom-model", parsed.model);
+}
+
 test "splitPrimaryModelRef rejects malformed values" {
     try std.testing.expect(splitPrimaryModelRef("noslash") == null);
     try std.testing.expect(splitPrimaryModelRef("/model-only") == null);
     try std.testing.expect(splitPrimaryModelRef("provider/") == null);
+    try std.testing.expect(splitPrimaryModelRef("custom:https://api.example.com/v1/") == null);
 }
 
 fn setExecNodeId(self: anytype, value: ?[]const u8) !void {
@@ -2632,11 +2682,10 @@ fn parseJsonBool(raw: []const u8) ?bool {
 }
 
 fn splitPrimaryModelRef(primary: []const u8) ?struct { provider: []const u8, model: []const u8 } {
-    const slash = std.mem.indexOfScalar(u8, primary, '/') orelse return null;
-    if (slash == 0 or slash + 1 >= primary.len) return null;
+    const split = model_refs.splitProviderModel(primary) orelse return null;
     return .{
-        .provider = primary[0..slash],
-        .model = primary[slash + 1 ..],
+        .provider = split.provider orelse return null,
+        .model = split.model,
     };
 }
 
