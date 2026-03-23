@@ -432,7 +432,7 @@ Config: `~/.nullclaw/config.json` (created by `onboard`)
       "url": "https://mcp.example.com/rpc",
       "timeout_ms": 10000,
       "headers": {
-        "Authorization": "Bearer ${MCP_TOKEN}"
+        "Authorization": "Bearer <YOUR_MCP_TOKEN>"
       }
     }
   },
