@@ -25,6 +25,11 @@ extern "kernel32" fn WideCharToMultiByte(
 
 extern "kernel32" fn GetACP() callconv(.winapi) std.os.windows.UINT;
 extern "kernel32" fn GetProcessId(process_handle: std.os.windows.HANDLE) callconv(.winapi) std.os.windows.DWORD;
+extern "kernel32" fn OpenProcess(
+    desired_access: std.os.windows.DWORD,
+    inherit_handle: std.os.windows.BOOL,
+    process_id: std.os.windows.DWORD,
+) callconv(.winapi) ?std.os.windows.HANDLE;
 
 const CP_UTF8: std.os.windows.UINT = 65001;
 const CP_GBK: std.os.windows.UINT = 936;
@@ -69,22 +74,25 @@ const ProcessWatcherCtx = struct {
     timed_out: *AtomicBool,
 };
 
+fn terminateWindowsProcessTreeByPid(pid: std.os.windows.DWORD) void {
+    if (pid == 0) return;
+
+    var pid_buf: [32]u8 = undefined;
+    if (std.fmt.bufPrint(&pid_buf, "{d}", .{pid})) |pid_arg| {
+        // `TerminateProcess` only reaches the direct child handle; use
+        // `taskkill /T` first so shell wrappers do not strand descendants.
+        var taskkill = std.process.Child.init(&.{ "taskkill", "/T", "/F", "/PID", pid_arg }, std.heap.page_allocator);
+        taskkill.stdin_behavior = .Ignore;
+        taskkill.stdout_behavior = .Ignore;
+        taskkill.stderr_behavior = .Ignore;
+        taskkill.create_no_window = true;
+        _ = taskkill.spawnAndWait() catch null;
+    } else |_| {}
+}
+
 fn terminateChild(child: *std.process.Child) void {
     if (comptime builtin.os.tag == .windows) {
-        const pid = GetProcessId(child.id);
-        if (pid != 0) {
-            var pid_buf: [32]u8 = undefined;
-            if (std.fmt.bufPrint(&pid_buf, "{d}", .{pid})) |pid_arg| {
-                // `TerminateProcess` only reaches the direct child handle; use
-                // `taskkill /T` first so shell wrappers do not strand descendants.
-                var taskkill = std.process.Child.init(&.{ "taskkill", "/T", "/F", "/PID", pid_arg }, std.heap.page_allocator);
-                taskkill.stdin_behavior = .Ignore;
-                taskkill.stdout_behavior = .Ignore;
-                taskkill.stderr_behavior = .Ignore;
-                taskkill.create_no_window = true;
-                _ = taskkill.spawnAndWait() catch null;
-            } else |_| {}
-        }
+        terminateWindowsProcessTreeByPid(GetProcessId(child.id));
         std.os.windows.TerminateProcess(child.id, 1) catch {};
     } else if (comptime builtin.os.tag == .wasi) {
         return;
@@ -139,6 +147,19 @@ fn processExists(pid: std.posix.pid_t) bool {
         else => return true,
     };
     return true;
+}
+
+fn processExistsWindows(pid: std.os.windows.DWORD) bool {
+    if (pid == 0) return false;
+
+    const handle = OpenProcess(std.os.windows.SYNCHRONIZE, 0, pid) orelse return false;
+    defer std.os.windows.CloseHandle(handle);
+
+    std.os.windows.WaitForSingleObject(handle, 0) catch |err| switch (err) {
+        error.WaitTimeOut => return true,
+        else => return false,
+    };
+    return false;
 }
 
 fn appendUtf8Replacement(out: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator) !void {
@@ -451,6 +472,53 @@ test "run zero timeout disables watchdog" {
     try std.testing.expect(result.success);
     try std.testing.expect(!result.timed_out);
     try std.testing.expect(std.mem.indexOf(u8, result.stdout, "done") != null);
+}
+
+test "run timeout kills Windows shell descendants" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+    const pid_path = try std.fs.path.join(allocator, &.{ tmp_path, "child.pid" });
+    defer allocator.free(pid_path);
+    const command = try std.fmt.allocPrint(
+        allocator,
+        "powershell.exe -NoProfile -Command \"$PID | Set-Content -NoNewline -Path '{s}'; Start-Sleep -Seconds 8\"",
+        .{pid_path},
+    );
+    defer allocator.free(command);
+
+    const result = try run(allocator, &.{ "cmd.exe", "/c", command }, .{
+        .timeout_ns = 1 * std.time.ns_per_s,
+    });
+    defer result.deinit(allocator);
+
+    try std.testing.expect(result.timed_out);
+
+    const pid_bytes = try std.fs.cwd().readFileAlloc(allocator, pid_path, 32);
+    defer allocator.free(pid_bytes);
+    const child_pid = try std.fmt.parseInt(
+        std.os.windows.DWORD,
+        std.mem.trim(u8, pid_bytes, " \t\r\n"),
+        10,
+    );
+    defer if (processExistsWindows(child_pid)) terminateWindowsProcessTreeByPid(child_pid);
+
+    var exited = false;
+    var i: usize = 0;
+    while (i < 40) : (i += 1) {
+        if (!processExistsWindows(child_pid)) {
+            exited = true;
+            break;
+        }
+        std.Thread.sleep(50 * std.time.ns_per_ms);
+    }
+
+    try std.testing.expect(exited);
 }
 
 test "run timeout kills spawned shell descendants" {
