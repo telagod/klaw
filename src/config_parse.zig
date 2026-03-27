@@ -125,6 +125,31 @@ fn splitPrimaryModelRef(primary: []const u8) ?PrimaryModelRef {
     };
 }
 
+fn parsePrimaryModelObject(
+    legacy_default_provider_detected: bool,
+    model_obj: std.json.ObjectMap,
+) ?PrimaryModelRef {
+    const primary_val = model_obj.get("primary") orelse return null;
+
+    if (model_obj.get("provider")) |provider_val| {
+        if (provider_val != .string or primary_val != .string) return null;
+        return .{
+            .provider = if (legacy_default_provider_detected) "" else provider_val.string,
+            .model = primary_val.string,
+        };
+    }
+
+    if (primary_val != .string) return null;
+    if (splitPrimaryModelRef(primary_val.string)) |parsed_ref| return parsed_ref;
+    if (legacy_default_provider_detected) {
+        return .{
+            .provider = "",
+            .model = primary_val.string,
+        };
+    }
+    return null;
+}
+
 fn parseDiagnosticsOtelHeaders(
     allocator: std.mem.Allocator,
     value: std.json.Value,
@@ -781,31 +806,23 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
     // Agents section: agents.defaults.model.primary (provider/model) + agents.defaults.heartbeat + agents.list[]
     if (root.get("agents")) |agents_val| {
         if (agents_val == .object) {
-            // agents.defaults.model.primary (provider/model) → self.default_provider + self.default_model
+            // agents.defaults.model.primary (provider/model) or
+            // agents.defaults.model.{provider,primary} → self.default_provider + self.default_model
             // agents.defaults.heartbeat → self.heartbeat
             if (agents_val.object.get("defaults")) |defaults| {
                 if (defaults == .object) {
                     if (defaults.object.get("model")) |mdl| {
                         if (mdl == .object) {
-                            if (mdl.object.get("primary")) |v| {
-                                if (v == .string) {
-                                    // Always try to parse primary field - it may contain full provider/model info
-                                    // or just the model part (when legacy default_provider exists)
-                                    if (splitPrimaryModelRef(v.string)) |parsed_ref| {
-                                        self.default_model = try self.allocator.dupe(u8, parsed_ref.model);
-                                        // Only update provider if not already set from legacy field
-                                        if (!self.legacy_default_provider_detected) {
-                                            self.default_provider = try self.allocator.dupe(u8, parsed_ref.provider);
-                                        }
-                                    } else if (self.legacy_default_provider_detected) {
-                                        // Legacy top-level default_provider + model-only primary.
-                                        self.default_model = try self.allocator.dupe(u8, v.string);
-                                    } else if (!self.legacy_default_provider_detected) {
-                                        // Only fail if neither legacy nor new format provides valid data
-                                        self.default_provider = "";
-                                        self.default_model = null;
-                                    }
+                            if (parsePrimaryModelObject(self.legacy_default_provider_detected, mdl.object)) |parsed_ref| {
+                                self.default_model = try self.allocator.dupe(u8, parsed_ref.model);
+                                // Only update provider if not already set from legacy field.
+                                if (!self.legacy_default_provider_detected) {
+                                    self.default_provider = try self.allocator.dupe(u8, parsed_ref.provider);
                                 }
+                            } else if (!self.legacy_default_provider_detected) {
+                                // Only fail if neither legacy nor new format provides valid data.
+                                self.default_provider = "";
+                                self.default_model = null;
                             }
                         }
                     }
