@@ -382,7 +382,7 @@ pub const A2aResponse = struct {
 // ── Handler: Agent Card ─────────────────────────────────────────
 
 /// Build the A2A agent card JSON response.
-/// vision_capable: probe result from SessionManager.probeVision(); null = not yet probed.
+/// vision_capable: probe result from SessionManager.probeVision(); null = not confirmed.
 /// The effective multi_modal flag is: vision_capable if set, else cfg.a2a.multi_modal (manual override).
 pub fn handleAgentCard(allocator: std.mem.Allocator, cfg: *const Config, vision_capable: ?bool) A2aResponse {
     var buf: std.ArrayListUnmanaged(u8) = .empty;

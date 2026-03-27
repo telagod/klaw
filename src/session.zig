@@ -218,7 +218,7 @@ pub const SessionManager = struct {
     subagent_manager: ?*@import("subagent.zig").SubagentManager = null,
 
     /// Result of the startup vision probe against the configured model.
-    /// null = not yet probed (probe not run or skipped), true = model accepts images,
+    /// null = not yet confirmed (probe not run, skipped, or inconclusive), true = model accepts images,
     /// false = model rejected images (ProviderDoesNotSupportVision).
     vision_capable: ?bool = null,
 
@@ -326,10 +326,9 @@ pub const SessionManager = struct {
 
     /// Probe whether the configured model accepts image input by sending a minimal
     /// 1×1 white JPEG directly to the provider (no session history, no tools).
-    /// Sets self.vision_capable to true/false accordingly; errors other than
-    /// ProviderDoesNotSupportVision are treated as "capable" (benefit of the doubt —
-    /// the model exists but returned a transient error; we'd rather not hide the
-    /// paperclip from the user). The result is cached — subsequent calls are no-ops.
+    /// Sets self.vision_capable to true/false accordingly. Errors other than
+    /// ProviderDoesNotSupportVision leave the result unset so callers can fall
+    /// back to explicit configuration. The result is cached once confirmed.
     pub fn probeVision(self: *SessionManager, allocator: std.mem.Allocator) void {
         if (self.vision_capable != null) return;
 
@@ -371,9 +370,7 @@ pub const SessionManager = struct {
                 log.info("vision probe: model '{s}' does not support vision", .{primary_model});
                 self.vision_capable = false;
             } else {
-                // Transient error (network, rate limit, etc.) — assume capable.
-                log.info("vision probe: model '{s}' probe inconclusive ({s}), assuming capable", .{ primary_model, @errorName(err) });
-                self.vision_capable = true;
+                log.info("vision probe: model '{s}' probe inconclusive ({s}), leaving capability unset", .{ primary_model, @errorName(err) });
             }
             return;
         };
@@ -1956,6 +1953,8 @@ const testing = std.testing;
 
 const MockProvider = struct {
     response: []const u8,
+    chat_error: ?anyerror = null,
+    chat_calls: usize = 0,
 
     const vtable = Provider.VTable{
         .chatWithSystem = mockChatWithSystem,
@@ -1989,6 +1988,8 @@ const MockProvider = struct {
         _: f64,
     ) anyerror!providers.ChatResponse {
         const self: *MockProvider = @ptrCast(@alignCast(ptr));
+        self.chat_calls += 1;
+        if (self.chat_error) |err| return err;
         return .{ .content = try allocator.dupe(u8, self.response) };
     }
 
@@ -2251,6 +2252,36 @@ fn testConfig() Config {
         .default_model = "test/mock-model",
         .allocator = testing.allocator,
     };
+}
+
+test "probeVision caches unsupported result" {
+    var mock = MockProvider{
+        .response = "ok",
+        .chat_error = error.ProviderDoesNotSupportVision,
+    };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+
+    sm.probeVision(testing.allocator);
+    try testing.expectEqual(@as(?bool, false), sm.vision_capable);
+    try testing.expectEqual(@as(usize, 1), mock.chat_calls);
+
+    sm.probeVision(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), mock.chat_calls);
+}
+
+test "probeVision leaves capability unset on transient provider failure" {
+    // Regression: inconclusive startup probes must fall back to cfg.a2a.multi_modal.
+    var mock = MockProvider{
+        .response = "ok",
+        .chat_error = error.ProviderError,
+    };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+
+    sm.probeVision(testing.allocator);
+    try testing.expect(sm.vision_capable == null);
+    try testing.expectEqual(@as(usize, 1), mock.chat_calls);
 }
 
 fn testBuildClaimToken(
