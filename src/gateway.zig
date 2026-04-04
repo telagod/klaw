@@ -2186,7 +2186,6 @@ fn configureRequestReadTimeout(stream: *std.net.Stream, timeout_secs: u64) void 
 fn readHttpRequestFromReader(allocator: std.mem.Allocator, reader: anytype, max_body: usize) ![]u8 {
     var request_buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer request_buf.deinit(allocator);
-
     var expected_total: ?usize = null;
     const max_request_size = maxHttpRequestSize(max_body);
     var chunk: [2048]u8 = undefined;
@@ -2216,6 +2215,11 @@ fn readHttpRequestFromReader(allocator: std.mem.Allocator, reader: anytype, max_
 
 fn readHttpRequest(allocator: std.mem.Allocator, stream: *std.net.Stream, max_body: usize) ![]u8 {
     return readHttpRequestFromReader(allocator, stream, max_body);
+}
+
+fn maybeProbeA2aVision(session_mgr: anytype, allocator: std.mem.Allocator, cfg: *const Config) void {
+    if (!cfg.a2a.enabled) return;
+    session_mgr.probeVision(allocator);
 }
 
 const CONTENT_TYPE_JSON = "application/json";
@@ -5080,6 +5084,8 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                     .subagent_manager = subagent_manager_opt,
                     .bootstrap_provider = bootstrap_provider_opt,
                     .backend_name = cfg.memory.backend,
+                    .sandbox_backend = cfg.security.sandbox.backend,
+                    .sandbox_enabled = cfg.security.sandbox.enabled orelse true,
                 }) catch &.{};
 
                 var sm = session_mod.SessionManager.init(allocator, cfg, provider_i, tools_slice, mem_opt, runtime_observer.?.observer(), if (mem_rt) |rt| rt.session_store else null, if (mem_rt) |*rt| rt.response_cache else null);
@@ -5091,6 +5097,9 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                     tools_mod.bindMemoryRuntime(tools_slice, rt);
                 }
                 session_mgr_opt = sm;
+                // Eagerly probe whether the model accepts image input so we can
+                // advertise multi_modal capability in the agent card accurately.
+                if (session_mgr_opt) |*mgr| maybeProbeA2aVision(mgr, allocator, cfg);
             }
         }
     } else {
@@ -5280,7 +5289,8 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
             // A2A Agent Card discovery (public, no auth).
             if (config_opt) |cfg| {
                 if (cfg.a2a.enabled) {
-                    const card = a2a.handleAgentCard(req_allocator, cfg);
+                    const vision_capable = if (session_mgr_opt) |sm| sm.vision_capable else null;
+                    const card = a2a.handleAgentCard(req_allocator, cfg, vision_capable);
                     response_status = card.status;
                     response_body = card.body;
                 } else {
@@ -7774,6 +7784,20 @@ test "expectedHttpRequestSize rejects oversized content length" {
     try std.testing.expectError(error.RequestTooLarge, expectedHttpRequestSize(raw, MAX_BODY_SIZE));
 }
 
+test "expectedHttpRequestSize honors configured max body size" {
+    // Regression: gateway.max_body_size_bytes must raise the inbound cap for A2A inlineData uploads.
+    const content_length: usize = MAX_BODY_SIZE + 1;
+    const raw = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "POST /webhook HTTP/1.1\r\nHost: localhost\r\nContent-Length: {d}\r\n\r\n",
+        .{content_length},
+    );
+    defer std.testing.allocator.free(raw);
+
+    const expected = (try expectedHttpRequestSize(raw, content_length)).?;
+    try std.testing.expectEqual((headerEndOffset(raw).? + content_length), expected);
+}
+
 test "readHttpRequestFromReader assembles fragmented request" {
     const ChunkedReader = struct {
         chunks: []const []const u8,
@@ -7807,6 +7831,57 @@ test "readHttpRequestFromReader assembles fragmented request" {
     const raw = try readHttpRequestFromReader(std.testing.allocator, &reader, MAX_BODY_SIZE);
     defer std.testing.allocator.free(raw);
     try std.testing.expectEqualStrings(expected, raw);
+}
+
+test "readHttpRequestFromReader honors configured max body size above default" {
+    const ChunkedReader = struct {
+        chunks: []const []const u8,
+        chunk_idx: usize = 0,
+        offset_in_chunk: usize = 0,
+
+        fn read(self: *@This(), out: []u8) !usize {
+            while (self.chunk_idx < self.chunks.len and self.offset_in_chunk >= self.chunks[self.chunk_idx].len) {
+                self.chunk_idx += 1;
+                self.offset_in_chunk = 0;
+            }
+            if (self.chunk_idx >= self.chunks.len) return 0;
+
+            const chunk = self.chunks[self.chunk_idx];
+            const remaining = chunk[self.offset_in_chunk..];
+            const n = @min(out.len, remaining.len);
+            std.mem.copyForwards(u8, out[0..n], remaining[0..n]);
+            self.offset_in_chunk += n;
+            return n;
+        }
+    };
+
+    // Regression: requests larger than 64 KiB must succeed when config raises the limit.
+    const body_len = MAX_BODY_SIZE + 1;
+    const body = try std.testing.allocator.alloc(u8, body_len);
+    defer std.testing.allocator.free(body);
+    @memset(body, 'a');
+
+    const header = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "POST /pair HTTP/1.1\r\nHost: localhost\r\nContent-Length: {d}\r\n\r\n",
+        .{body_len},
+    );
+    defer std.testing.allocator.free(header);
+
+    const request = try std.mem.concat(std.testing.allocator, u8, &.{ header, body });
+    defer std.testing.allocator.free(request);
+
+    const split = header.len + 1024;
+    const chunks = [_][]const u8{
+        request[0..header.len],
+        request[header.len..split],
+        request[split..],
+    };
+    var reader = ChunkedReader{ .chunks = chunks[0..] };
+
+    const raw = try readHttpRequestFromReader(std.testing.allocator, &reader, body_len);
+    defer std.testing.allocator.free(raw);
+    try std.testing.expectEqualStrings(request, raw);
 }
 
 test "readHttpRequestFromReader returns IncompleteRequest for truncated body" {
@@ -7849,6 +7924,46 @@ test "readHttpRequestFromReader maps WouldBlock to RequestTimeout" {
 
     var reader = TimeoutReader{};
     try std.testing.expectError(error.RequestTimeout, readHttpRequestFromReader(std.testing.allocator, &reader, MAX_BODY_SIZE));
+}
+
+test "maybeProbeA2aVision skips probe when a2a is disabled" {
+    const ProbeSpy = struct {
+        calls: usize = 0,
+
+        fn probeVision(self: *@This(), _: std.mem.Allocator) void {
+            self.calls += 1;
+        }
+    };
+
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc_test",
+        .config_path = "/tmp/yc_test/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var spy = ProbeSpy{};
+    maybeProbeA2aVision(&spy, std.testing.allocator, &cfg);
+    try std.testing.expectEqual(@as(usize, 0), spy.calls);
+}
+
+test "maybeProbeA2aVision runs probe when a2a is enabled" {
+    const ProbeSpy = struct {
+        calls: usize = 0,
+
+        fn probeVision(self: *@This(), _: std.mem.Allocator) void {
+            self.calls += 1;
+        }
+    };
+
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc_test",
+        .config_path = "/tmp/yc_test/config.json",
+        .allocator = std.testing.allocator,
+    };
+    cfg.a2a.enabled = true;
+
+    var spy = ProbeSpy{};
+    maybeProbeA2aVision(&spy, std.testing.allocator, &cfg);
+    try std.testing.expectEqual(@as(usize, 1), spy.calls);
 }
 
 test "userFacingAgentError maps ProviderDoesNotSupportVision" {
