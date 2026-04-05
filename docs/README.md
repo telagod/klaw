@@ -27,10 +27,8 @@ This directory is the documentation index for nullclaw.
 
 ## Additional References
 
-These pages are useful context, but they are not part of the main user/operator onboarding path:
-
-- [Integration Analysis](./integration-analysis.md)
-- [Integration Roadmap](./integration-roadmap.md)
 - [Contributing](../CONTRIBUTING.md)
 - [Security Policy](../SECURITY.md)
 - [Signal Deployment](../SIGNAL.md)
+- [Archived: Integration Analysis](./archive/integration-analysis.md)
+- [Archived: Integration Roadmap](./archive/integration-roadmap.md)
