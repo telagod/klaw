@@ -505,6 +505,28 @@ pub fn convertToolsOpenAI(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.A
     try buf.append(allocator, ']');
 }
 
+/// Serialize tool definitions into an OpenAI Responses API format JSON array, appending directly into `buf`.
+/// Format: [{"type":"function","name":"...","description":"...","parameters":{...}}]
+/// Unlike chat completions, the Responses API uses a flat structure without the nested "function" wrapper.
+pub fn convertToolsResponses(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, tools: []const ToolSpec) !void {
+    if (tools.len == 0) {
+        try buf.appendSlice(allocator, "[]");
+        return;
+    }
+    try buf.append(allocator, '[');
+    for (tools, 0..) |tool, i| {
+        if (i > 0) try buf.append(allocator, ',');
+        try buf.appendSlice(allocator, "{\"type\":\"function\",\"name\":");
+        try json_util.appendJsonString(buf, allocator, tool.name);
+        try buf.appendSlice(allocator, ",\"description\":");
+        try json_util.appendJsonString(buf, allocator, tool.description);
+        try buf.appendSlice(allocator, ",\"parameters\":");
+        try buf.appendSlice(allocator, tool.parameters_json);
+        try buf.append(allocator, '}');
+    }
+    try buf.append(allocator, ']');
+}
+
 /// Serialize tool definitions into an Anthropic-format JSON array, appending directly into `buf`.
 /// Format: [{"name":"...","description":"...","input_schema":{...}}]
 pub fn convertToolsAnthropic(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, tools: []const ToolSpec) !void {

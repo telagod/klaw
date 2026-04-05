@@ -545,7 +545,7 @@ pub const OpenAiCompatibleProvider = struct {
         if (request.tools) |tools| {
             if (tools.len > 0) {
                 try buf.appendSlice(allocator, ",\"tools\":");
-                try root.convertToolsOpenAI(&buf, allocator, tools);
+                try root.convertToolsResponses(&buf, allocator, tools);
                 try buf.appendSlice(allocator, ",\"tool_choice\":\"auto\"");
             }
         }

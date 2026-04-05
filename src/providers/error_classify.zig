@@ -309,6 +309,7 @@ fn classifyFromFields(
 /// Anthropic, and Gemini APIs.
 pub fn classifyErrorObject(root_obj: anytype) ?ApiErrorKind {
     const err_value = root_obj.get("error") orelse return null;
+    if (err_value == .null) return null;
     if (err_value == .string) {
         return classifyFromFields(null, null, null, err_value.string);
     }
